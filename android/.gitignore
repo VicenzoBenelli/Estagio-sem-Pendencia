@@ -1,0 +1,13 @@
+/.gradle
+/captures/
+/local.properties
+# Critério local de JVM do daemon; a versão compartilhada será definida pela equipe.
+gradle/gradle-daemon-jvm.properties
+GeneratedPluginRegistrant.java
+.cxx/
+
+# Remember to never publicly share your keystore.
+# See https://flutter.dev/to/reference-keystore
+key.properties
+**/*.keystore
+**/*.jks
