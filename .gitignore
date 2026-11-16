@@ -31,3 +31,4 @@ key.properties
 *.log
 *.swp
 .history/
+AGENTS.md
