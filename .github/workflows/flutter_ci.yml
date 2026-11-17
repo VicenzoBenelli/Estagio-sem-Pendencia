@@ -11,9 +11,14 @@ on:
 
 jobs:
   quality:
+    name: Flutter Quality & Builds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.47.3'
@@ -25,3 +30,27 @@ jobs:
       - run: flutter test
       - name: Build Web
         run: flutter build web
+      - name: Build Android Debug
+        run: flutter build apk --debug
+
+  supabase_db_and_auth:
+    name: Supabase Migrations, pgTAP & HTTP Auth/RLS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Start local Supabase stack
+        run: npx supabase start --yes -x studio,edge-runtime,imgproxy,logflare,vector,supavisor
+      - name: Reset database from scratch (migrations + seed)
+        run: npx supabase db reset --yes
+      - name: Run pgTAP database & RLS tests
+        run: npx supabase test db
+      - name: Run HTTP Auth & RLS integration scenarios
+        run: node tool/test_auth_and_rls_http.mjs
+      - name: Stop local Supabase stack
+        if: always()
+        run: npx supabase stop --no-backup

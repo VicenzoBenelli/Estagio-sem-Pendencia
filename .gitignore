@@ -26,6 +26,9 @@
 *.keystore
 key.properties
 
+# Node tooling (Supabase CLI devDependency)
+node_modules/
+
 # Operating system and editor files
 .DS_Store
 *.log

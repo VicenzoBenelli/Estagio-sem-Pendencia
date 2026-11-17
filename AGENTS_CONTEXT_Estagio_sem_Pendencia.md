@@ -1,6 +1,6 @@
 # ESTÁGIO SEM PENDÊNCIA — CONTEXTO CANÔNICO PARA AGENTES DE IA
 
-> **Status:** planejamento, não código pronto. **Atualizado:** 09/10/2026. **Fonte de verdade para trabalho:** Trello (ESP-01 a ESP-32), este arquivo e decisões documentadas no repositório. O PDF do time espelha esta especificação.
+> **Status:** em implementação por lotes (metodologia SGMI-FAST/30; ESP-06 integrada à `main`, Lote 1 ESP-07/08/09 em desenvolvimento na branch `vicenzo`; especificações ESP-01 a ESP-32 preservadas como referência). **Atualizado:** 16/11/2026. **Fonte de verdade para trabalho:** Trello (ESP-01 a ESP-32), este arquivo e decisões documentadas no repositório. O PDF do time espelha esta especificação.
 
 ## 0. Instruções mandatórias para agentes de IA
 

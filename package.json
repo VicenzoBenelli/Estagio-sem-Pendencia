@@ -1,0 +1,8 @@
+{
+  "name": "estagio_sem_pendencia_tooling",
+  "private": true,
+  "description": "Ferramentas de desenvolvimento local e CI para Estágio sem Pendência.",
+  "devDependencies": {
+    "supabase": "3.2.0"
+  }
+}
