@@ -926,12 +926,687 @@ async function main() {
     assert.equal(newPassLoginB.status, 200, `Login com nova senha falhou: ${sanitizeHttpSummary(newPassLoginB)}`);
     console.log('✓ Cenário 14: Recuperação e redefinição de senha completadas ponta a ponta');
 
+    // ========================================================================
+    // LOTE 2 (ESP-10 / ESP-11 / ESP-12): Abertura segura, snapshot e leituras
+    // ========================================================================
+    await runLote2ProcessAndChecklistScenarios({
+      env,
+      runId,
+      clientHeaders,
+      serviceHeaders,
+      sensitivePool,
+    });
+
     console.log('\nTODOS OS CENÁRIOS HTTP/AUTH/RLS E HARDENING PASSARAM COM SUCESSO.');
   } catch (err) {
     const safeMessage = redactKnownSecrets(err?.message ?? String(err), sensitivePool);
     console.error(`\n[FALHA NO TESTE HTTP]: ${safeMessage}`);
     process.exit(1);
   }
+}
+
+async function createConfirmedAdminUser(apiUrl, serviceHeaders, clientHeaders, anonKey, sensitivePool, { email, password, fullName }) {
+  const created = await httpJson(`${apiUrl}/auth/v1/admin/users`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { full_name: fullName },
+    },
+  });
+  assert.equal(created.status, 200, `Erro criando usuário admin (${email}): ${sanitizeHttpSummary(created)}`);
+
+  const login = await httpJson(`${apiUrl}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: clientHeaders(anonKey),
+    body: { email, password },
+  });
+  assert.equal(login.status, 200, `Erro autenticando usuário (${email}): ${sanitizeHttpSummary(login)}`);
+  sensitivePool.push(password, login.data.access_token, login.data.refresh_token);
+
+  return {
+    id: created.data.id,
+    token: login.data.access_token,
+  };
+}
+
+async function createIsolatedCatalogRecord(apiUrl, serviceHeaders, {
+  institutionId = DEMO_INSTITUTION_ID,
+  suffix,
+  courseActive = true,
+  modalityActive = true,
+  templateStatus = null,
+  items = [],
+}) {
+  const course = await httpJson(`${apiUrl}/rest/v1/courses`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      institution_id: institutionId,
+      code: `L2_COURSE_${suffix}`,
+      name: `Curso L2 HTTP (${suffix})`,
+      is_demo: true,
+      active: courseActive,
+    },
+  });
+  assert.equal(course.status, 201, `Erro criando curso L2 (${suffix}): ${sanitizeHttpSummary(course)}`);
+  const courseId = course.data[0].id;
+
+  const modality = await httpJson(`${apiUrl}/rest/v1/course_modalities`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      course_id: courseId,
+      code: `L2_MOD_${suffix}`,
+      name: `Modalidade L2 HTTP (${suffix})`,
+      is_mandatory: true,
+      is_demo: true,
+      active: modalityActive,
+    },
+  });
+  assert.equal(modality.status, 201, `Erro criando modalidade L2 (${suffix}): ${sanitizeHttpSummary(modality)}`);
+  const modalityId = modality.data[0].id;
+
+  let templateId = null;
+  const createdItems = [];
+
+  if (templateStatus !== null) {
+    const tplDraft = await httpJson(`${apiUrl}/rest/v1/requirement_templates`, {
+      method: 'POST',
+      headers: { ...serviceHeaders, Prefer: 'return=representation' },
+      body: {
+        institution_id: institutionId,
+        course_id: courseId,
+        course_modality_id: modalityId,
+        version: 1,
+        title: `Template L2 v1 (${suffix})`,
+        source_reference: 'Dados fictícios automatizados Lote 2 HTTP',
+        status: 'draft',
+        is_demo: true,
+      },
+    });
+    assert.equal(tplDraft.status, 201, `Erro criando template L2 (${suffix}): ${sanitizeHttpSummary(tplDraft)}`);
+    templateId = tplDraft.data[0].id;
+
+    for (const itemSpec of items) {
+      const insertedItem = await httpJson(`${apiUrl}/rest/v1/requirement_template_items`, {
+        method: 'POST',
+        headers: { ...serviceHeaders, Prefer: 'return=representation' },
+        body: {
+          template_id: templateId,
+          code: itemSpec.code,
+          title: itemSpec.title,
+          description: itemSpec.description,
+          acceptance_criteria: itemSpec.acceptanceCriteria,
+          is_required: itemSpec.isRequired,
+          display_order: itemSpec.displayOrder,
+          is_demo: true,
+        },
+      });
+      assert.equal(insertedItem.status, 201, `Erro criando item L2 (${itemSpec.code}): ${sanitizeHttpSummary(insertedItem)}`);
+      createdItems.push(insertedItem.data[0]);
+    }
+
+    if (templateStatus === 'published' || templateStatus === 'archived') {
+      const pub = await httpJson(`${apiUrl}/rest/v1/requirement_templates?id=eq.${templateId}`, {
+        method: 'PATCH',
+        headers: serviceHeaders,
+        body: { status: 'published' },
+      });
+      assert.equal(pub.ok, true, `Erro publicando template L2 (${suffix}): ${sanitizeHttpSummary(pub)}`);
+    }
+    if (templateStatus === 'archived') {
+      const arch = await httpJson(`${apiUrl}/rest/v1/requirement_templates?id=eq.${templateId}`, {
+        method: 'PATCH',
+        headers: serviceHeaders,
+        body: { status: 'archived' },
+      });
+      assert.equal(arch.ok, true, `Erro arquivando template L2 (${suffix}): ${sanitizeHttpSummary(arch)}`);
+    }
+  }
+
+  return { institutionId, courseId, modalityId, templateId, items: createdItems };
+}
+
+async function runLote2ProcessAndChecklistScenarios({
+  env,
+  runId,
+  clientHeaders,
+  serviceHeaders,
+  sensitivePool,
+}) {
+  const passC = `DemoC!${crypto.randomBytes(8).toString('hex')}`;
+  const passD = `DemoD!${crypto.randomBytes(8).toString('hex')}`;
+  const passR3 = `DemoR3!${crypto.randomBytes(8).toString('hex')}`;
+  const passR4 = `DemoR4!${crypto.randomBytes(8).toString('hex')}`;
+
+  const studentC = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `estudante.c.l2.${runId}@demo.local`,
+    password: passC,
+    fullName: 'Estudante C Lote 2 HTTP',
+  });
+  const studentD = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `estudante.d.l2.${runId}@demo.local`,
+    password: passD,
+    fullName: 'Estudante D Lote 2 HTTP',
+  });
+  const reviewerR3 = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `revisor.r3.l2.${runId}@demo.local`,
+    password: passR3,
+    fullName: 'Revisor R3 Atribuído Lote 2 HTTP',
+  });
+  const reviewerR4 = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `revisor.r4.l2.${runId}@demo.local`,
+    password: passR4,
+    fullName: 'Revisor R4 Sem Escopo Lote 2 HTTP',
+  });
+
+  // Promover R3 e R4 para reviewer
+  for (const rev of [reviewerR3, reviewerR4]) {
+    const promote = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_set_user_role`, {
+      method: 'POST',
+      headers: serviceHeaders,
+      body: {
+        p_user_id: rev.id,
+        p_new_role: 'reviewer',
+        p_operator_type: OPERATOR_TYPE,
+        p_operator_identifier: OPERATOR_IDENTIFIER,
+        p_reason: 'Provisionamento Lote 2 HTTP',
+      },
+    });
+    assert.equal(promote.status, 200, `Erro promovendo revisor L2: ${sanitizeHttpSummary(promote)}`);
+  }
+
+  // Criar instituição inativa isolada por runId
+  const inactiveInst = await httpJson(`${env.apiUrl}/rest/v1/institutions`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      code: `L2_INST_INAT_${runId}`,
+      name: `Instituição Inativa HTTP (${runId})`,
+      is_demo: true,
+      active: false,
+    },
+  });
+  assert.equal(inactiveInst.status, 201, `Erro criando instituição inativa: ${sanitizeHttpSummary(inactiveInst)}`);
+  const inactiveInstId = inactiveInst.data[0].id;
+
+  // Catálogos isolados do Lote 2
+  const catMain = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `MAIN_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_OBR1_${runId}`,
+        title: '[Demo L2] Termo Obrigatório 1 v1',
+        description: 'Descrição obrigatória 1 v1',
+        acceptanceCriteria: 'Critério obrigatório 1 v1',
+        isRequired: true,
+        displayOrder: 1,
+      },
+      {
+        code: `L2_OBR2_${runId}`,
+        title: '[Demo L2] Plano Obrigatório 2 v1',
+        description: 'Descrição obrigatória 2 v1',
+        acceptanceCriteria: 'Critério obrigatório 2 v1',
+        isRequired: true,
+        displayOrder: 2,
+      },
+      {
+        code: `L2_OPC3_${runId}`,
+        title: '[Demo L2] Documento Opcional 3 v1',
+        description: 'Descrição opcional 3 v1',
+        acceptanceCriteria: 'Critério opcional 3 v1',
+        isRequired: false,
+        displayOrder: 3,
+      },
+    ],
+  });
+
+  // Criar v2 DRAFT coexistindo com v1 PUBLISHED em catMain para garantir que v2 draft não é escolhida
+  const catMainV2Draft = await httpJson(`${env.apiUrl}/rest/v1/requirement_templates`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      institution_id: catMain.institutionId,
+      course_id: catMain.courseId,
+      course_modality_id: catMain.modalityId,
+      version: 2,
+      title: `Template L2 v2 (${runId})`,
+      source_reference: 'Versão v2 fictícia',
+      status: 'draft',
+      is_demo: true,
+    },
+  });
+  assert.equal(catMainV2Draft.status, 201, `Erro criando template v2 draft: ${sanitizeHttpSummary(catMainV2Draft)}`);
+  const tplV2Id = catMainV2Draft.data[0].id;
+
+  const tplV2Item = await httpJson(`${env.apiUrl}/rest/v1/requirement_template_items`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      template_id: tplV2Id,
+      code: `L2_V2_OBR1_${runId}`,
+      title: '[Demo L2] Único Obrigatório V2',
+      description: 'Descrição v2',
+      acceptance_criteria: 'Critério v2',
+      is_required: true,
+      display_order: 1,
+      is_demo: true,
+    },
+  });
+  assert.equal(tplV2Item.status, 201, `Erro criando item v2: ${sanitizeHttpSummary(tplV2Item)}`);
+
+  const catOnlyOpt = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `OPT_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_ONLY_OPT_${runId}`,
+        title: '[Demo L2] Único Opcional',
+        description: 'Somente opcional',
+        acceptanceCriteria: 'Critério opcional',
+        isRequired: false,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catConcurrent = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `CONC_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_CONC_OBR_${runId}`,
+        title: '[Demo L2] Item Concorrência',
+        description: 'Teste concorrência',
+        acceptanceCriteria: 'Critério concorrência',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catNoTpl = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `NOTPL_${runId}`,
+    templateStatus: null,
+  });
+
+  const catDraftOnly = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `DRAFT_${runId}`,
+    templateStatus: 'draft',
+    items: [
+      {
+        code: `L2_DRAFT_${runId}`,
+        title: '[Demo L2] Draft Only',
+        description: 'Draft',
+        acceptanceCriteria: 'Draft',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catArchOnly = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `ARCH_${runId}`,
+    templateStatus: 'archived',
+    items: [
+      {
+        code: `L2_ARCH_${runId}`,
+        title: '[Demo L2] Archived Only',
+        description: 'Arch',
+        acceptanceCriteria: 'Arch',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catModInat = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `MODINAT_${runId}`,
+    modalityActive: false,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_MODINAT_${runId}`,
+        title: '[Demo L2] Mod Inativa',
+        description: 'Mod Inat',
+        acceptanceCriteria: 'Mod Inat',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catCourseInat = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `CURINAT_${runId}`,
+    courseActive: false,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_CURINAT_${runId}`,
+        title: '[Demo L2] Curso Inativo',
+        description: 'Cur Inat',
+        acceptanceCriteria: 'Cur Inat',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catInstInat = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    institutionId: inactiveInstId,
+    suffix: `INSTINAT_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L2_INSTINAT_${runId}`,
+        title: '[Demo L2] Inst Inativa',
+        description: 'Inst Inat',
+        acceptanceCriteria: 'Inst Inat',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  // Atribuir Revisor R3 apenas a catMain
+  const assignR3 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerR3.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: catMain.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L2 R3 somente catMain',
+    },
+  });
+  assert.equal(assignR3.status, 200, `Erro atribuindo R3: ${sanitizeHttpSummary(assignR3)}`);
+
+  // 1) Anon e Revisor bloqueados na RPC create_internship_process
+  const anonRpc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(env.anonKey),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.ok(anonRpc.status === 401 || anonRpc.status === 403, `Anon devia falhar RPC: ${sanitizeHttpSummary(anonRpc)}`);
+
+  const revRpc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerR4.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(revRpc.ok, false, 'Revisor não pode abrir processo via create_internship_process');
+  assert.ok(revRpc.status === 401 || revRpc.status === 403, `Esperado 401/403 para revisor, recebido ${sanitizeHttpSummary(revRpc)}`);
+
+  // 2) Tentativa de passar p_owner_id na RPC ou POST direto é bloqueada
+  const forgedOwnerRpc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC.token),
+    body: { p_course_modality_id: catMain.modalityId, p_owner_id: studentD.id },
+  });
+  assert.equal(forgedOwnerRpc.ok, false, 'RPC não deve aceitar p_owner_id arbitrário');
+
+  const directInsertProcess = await httpJson(`${env.apiUrl}/rest/v1/internship_processes`, {
+    method: 'POST',
+    headers: clientHeaders(studentC.token),
+    body: {
+      owner_id: studentD.id,
+      institution_id: catMain.institutionId,
+      course_id: catMain.courseId,
+      course_modality_id: catMain.modalityId,
+      template_id: catMain.templateId,
+      template_version: 1,
+      status: 'in_progress',
+    },
+  });
+  assert.ok(
+    directInsertProcess.status === 401 || directInsertProcess.status === 403,
+    `INSERT direto em internship_processes devia falhar: ${sanitizeHttpSummary(directInsertProcess)}`,
+  );
+
+  // 3) Catálogo ativo visível ao estudante autenticado (inclui seed + ativa, omite inativos)
+  const catalogProbeIds = [
+    '30000000-0000-4000-8000-000000000001',
+    catMain.modalityId,
+    catModInat.modalityId,
+    catCourseInat.modalityId,
+    catInstInat.modalityId,
+  ].join(',');
+  const activeCatalogRes = await httpJson(
+    `${env.apiUrl}/rest/v1/course_modalities?select=id,code,name,is_mandatory,active,courses!inner(id,code,name,active,institutions!inner(id,code,name,active)),requirement_templates(id,version,title,status)&id=in.(${catalogProbeIds})&active=eq.true&courses.active=eq.true&courses.institutions.active=eq.true&requirement_templates.status=eq.published`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(activeCatalogRes.status, 200, `Erro consultando catálogo ativo: ${sanitizeHttpSummary(activeCatalogRes)}`);
+  const returnedModIds = new Set(activeCatalogRes.data.map((row) => row.id));
+  assert.equal(returnedModIds.has('30000000-0000-4000-8000-000000000001'), true, 'Modalidade demo do seed deve constar no catálogo');
+  assert.equal(returnedModIds.has(catMain.modalityId), true, 'Modalidade ativa deve constar no catálogo');
+  assert.equal(returnedModIds.has(catModInat.modalityId), false, 'Modalidade inativa não deve aparecer no catálogo');
+  assert.equal(returnedModIds.has(catCourseInat.modalityId), false, 'Curso inativo não deve aparecer no catálogo');
+  assert.equal(returnedModIds.has(catInstInat.modalityId), false, 'Instituição inativa não deve aparecer no catálogo');
+
+  // 4) Estudante C abre processo em catMain -> recebe snapshot v1 completo e auditoria
+  const openMain = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(openMain.status, 200, `Erro abrindo processo catMain: ${sanitizeHttpSummary(openMain)}`);
+  const procC = openMain.data;
+  assert.ok(procC?.id, 'ID do processo deve ser retornado');
+  assert.equal(procC.owner_id, studentC.id, 'owner_id deve derivar do JWT do estudante C');
+  assert.equal(procC.institution_id, catMain.institutionId);
+  assert.equal(procC.course_id, catMain.courseId);
+  assert.equal(procC.course_modality_id, catMain.modalityId);
+  assert.equal(procC.template_id, catMain.templateId);
+  assert.equal(procC.template_version, 1, 'Deve escolher v1 published, ignorando v2 draft');
+  assert.equal(procC.status, 'in_progress');
+
+  // Leitura detalhada do processo pelo ID + joins
+  const procCDetail = await httpJson(
+    `${env.apiUrl}/rest/v1/internship_processes?id=eq.${procC.id}&select=id,owner_id,template_id,template_version,status,institutions(id,code,name),courses(id,code,name),course_modalities(id,code,name,is_mandatory),requirement_templates(id,version,title,source_reference)`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(procCDetail.status, 200);
+  assert.equal(procCDetail.data.length, 1);
+  assert.equal(procCDetail.data[0].course_modalities.id, catMain.modalityId);
+  assert.equal(procCDetail.data[0].requirement_templates.version, 1);
+
+  // Leitura ordenada do snapshot em process_requirements
+  const procCReqs = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procC.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(procCReqs.status, 200);
+  assert.equal(procCReqs.data.length, 3);
+  assert.deepEqual(
+    procCReqs.data.map((r) => [r.display_order, r.code, r.is_required, r.status, r.current_version, r.current_submission_id]),
+    [
+      [1, `L2_OBR1_${runId}`, true, 'not_submitted', 0, null],
+      [2, `L2_OBR2_${runId}`, true, 'not_submitted', 0, null],
+      [3, `L2_OPC3_${runId}`, false, 'not_submitted', 0, null],
+    ],
+  );
+  assert.equal(procCReqs.data[0].template_item_id, catMain.items[0].id);
+
+  // Progresso inicial (2 obrigatórios, 1 opcional excluído)
+  const procCProgress = await httpJson(
+    `${env.apiUrl}/rest/v1/process_progress_v?process_id=eq.${procC.id}`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(procCProgress.status, 200);
+  assert.equal(procCProgress.data.length, 1);
+  assert.equal(procCProgress.data[0].required_total, 2);
+  assert.equal(procCProgress.data[0].required_approved, 0);
+  assert.equal(procCProgress.data[0].progress_status, 'in_progress');
+  assert.equal(Number(procCProgress.data[0].progress_percentage), 0);
+
+  // Evento de auditoria process_created
+  const procCAudit = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?process_id=eq.${procC.id}&event_type=eq.process_created`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(procCAudit.status, 200);
+  assert.equal(procCAudit.data.length, 1);
+  assert.equal(procCAudit.data[0].actor_id, studentC.id);
+  assert.equal(procCAudit.data[0].operator_type, 'user_self_action');
+  assert.equal(procCAudit.data[0].operator_identifier, 'rpc:create_internship_process');
+
+  // 5) Processo sem obrigatórios -> indeterminate / null (nunca 100%)
+  const openOpt = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC.token),
+    body: { p_course_modality_id: catOnlyOpt.modalityId },
+  });
+  assert.equal(openOpt.status, 200, `Erro abrindo processo somente opcional: ${sanitizeHttpSummary(openOpt)}`);
+  const procOptId = openOpt.data.id;
+
+  const optProgress = await httpJson(
+    `${env.apiUrl}/rest/v1/process_progress_v?process_id=eq.${procOptId}`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(optProgress.status, 200);
+  assert.equal(optProgress.data[0].required_total, 0);
+  assert.equal(optProgress.data[0].progress_status, 'indeterminate');
+  assert.equal(optProgress.data[0].progress_percentage, null);
+
+  // 6) Duplicata sequencial + Concorrência HTTP real + Rejeições negativas sem audit_event espúrio
+  const dupCall = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(dupCall.status, 409, `Duplicata ativa devia retornar 409: ${sanitizeHttpSummary(dupCall)}`);
+  assert.equal(dupCall.data?.code, '23505');
+
+  const [concRes1, concRes2] = await Promise.all([
+    httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+      method: 'POST',
+      headers: clientHeaders(studentD.token),
+      body: { p_course_modality_id: catConcurrent.modalityId },
+    }),
+    httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+      method: 'POST',
+      headers: clientHeaders(studentD.token),
+      body: { p_course_modality_id: catConcurrent.modalityId },
+    }),
+  ]);
+  const concResults = [concRes1, concRes2];
+  const concSuccess = concResults.filter((r) => r.status === 200);
+  const concConflict = concResults.filter((r) => r.status === 409);
+  assert.equal(concSuccess.length, 1, `Concorrência devia aprovar exatamente 1 requisição (${concResults.map(sanitizeHttpSummary).join(' | ')})`);
+  assert.equal(concConflict.length, 1, `Concorrência devia rejeitar exatamente 1 requisição (${concResults.map(sanitizeHttpSummary).join(' | ')})`);
+  assert.equal(concConflict[0].data?.code, '23505');
+
+  // Rejeições negativas por modalidade/escopo/template
+  for (const [label, modalityId, expectedCode] of [
+    ['inexistente', crypto.randomUUID(), 'P0002'],
+    ['modalidade inativa', catModInat.modalityId, '23514'],
+    ['curso inativo', catCourseInat.modalityId, '23514'],
+    ['instituição inativa', catInstInat.modalityId, '23514'],
+    ['sem template', catNoTpl.modalityId, '23514'],
+    ['apenas draft', catDraftOnly.modalityId, '23514'],
+    ['apenas archived', catArchOnly.modalityId, '23514'],
+  ]) {
+    const failRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+      method: 'POST',
+      headers: clientHeaders(studentC.token),
+      body: { p_course_modality_id: modalityId },
+    });
+    assert.equal(failRes.ok, false, `Cenário '${label}' devia falhar`);
+    assert.equal(failRes.data?.code, expectedCode, `Cenário '${label}' devia retornar ${expectedCode}: ${sanitizeHttpSummary(failRes)}`);
+  }
+
+  // Confirmar contagem exata de processos e audit_events de Estudante C após todas as falhas
+  const cAllProcs = await httpJson(`${env.apiUrl}/rest/v1/internship_processes?select=id`, {
+    headers: clientHeaders(studentC.token),
+  });
+  assert.equal(cAllProcs.data.length, 2, 'Nenhuma falha negativa pode gerar processo parcial para Estudante C');
+
+  const cAllCreatedAudits = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?actor_id=eq.${studentC.id}&event_type=eq.process_created`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(cAllCreatedAudits.data.length, 2, 'audit_events process_created só deve registrar os 2 sucessos');
+
+  // 7) Isolamento cruzado por ID conhecido: D, R4 (sem escopo), R3 (com escopo)
+  for (const endpoint of [
+    `/rest/v1/internship_processes?id=eq.${procC.id}`,
+    `/rest/v1/process_requirements?process_id=eq.${procC.id}`,
+    `/rest/v1/process_progress_v?process_id=eq.${procC.id}`,
+    `/rest/v1/audit_events?process_id=eq.${procC.id}`,
+  ]) {
+    const dRead = await httpJson(`${env.apiUrl}${endpoint}`, { headers: clientHeaders(studentD.token) });
+    assert.equal(dRead.status, 200);
+    assert.equal(dRead.data.length, 0, `Estudante D não pode ler ${endpoint}`);
+
+    const r4Read = await httpJson(`${env.apiUrl}${endpoint}`, { headers: clientHeaders(reviewerR4.token) });
+    assert.equal(r4Read.status, 200);
+    assert.equal(r4Read.data.length, 0, `Revisor R4 sem escopo não pode ler ${endpoint}`);
+  }
+
+  const r3ProcC = await httpJson(`${env.apiUrl}/rest/v1/internship_processes?id=eq.${procC.id}`, {
+    headers: clientHeaders(reviewerR3.token),
+  });
+  assert.equal(r3ProcC.data.length, 1, 'Revisor R3 vê processo em seu escopo');
+
+  const r3OutOfScope = await httpJson(`${env.apiUrl}/rest/v1/internship_processes?id=eq.${procOptId}`, {
+    headers: clientHeaders(reviewerR3.token),
+  });
+  assert.equal(r3OutOfScope.data.length, 0, 'Revisor R3 não vê processo fora do escopo por ID');
+
+  // 8) Publicar v2 em catMain e confirmar que D abre com v2 sem alterar o snapshot v1 de C
+  const archV1 = await httpJson(`${env.apiUrl}/rest/v1/requirement_templates?id=eq.${catMain.templateId}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'archived' },
+  });
+  assert.equal(archV1.ok, true, `Erro arquivando v1: ${sanitizeHttpSummary(archV1)}`);
+
+  const pubV2 = await httpJson(`${env.apiUrl}/rest/v1/requirement_templates?id=eq.${tplV2Id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'published' },
+  });
+  assert.equal(pubV2.ok, true, `Erro publicando v2: ${sanitizeHttpSummary(pubV2)}`);
+
+  const openV2ForD = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentD.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(openV2ForD.status, 200, `Erro abrindo v2 para D: ${sanitizeHttpSummary(openV2ForD)}`);
+  assert.equal(openV2ForD.data.template_id, tplV2Id);
+  assert.equal(openV2ForD.data.template_version, 2);
+
+  const procDReqs = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${openV2ForD.data.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentD.token) },
+  );
+  assert.equal(procDReqs.data.length, 1);
+  assert.equal(procDReqs.data[0].code, `L2_V2_OBR1_${runId}`);
+
+  // Validar que o processo e snapshot v1 de C permaneceram inalterados
+  const procCReqsAfterV2 = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procC.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentC.token) },
+  );
+  assert.equal(procCReqsAfterV2.data.length, 3);
+  assert.deepEqual(
+    procCReqsAfterV2.data.map((r) => [r.display_order, r.code, r.title, r.is_required]),
+    [
+      [1, `L2_OBR1_${runId}`, '[Demo L2] Termo Obrigatório 1 v1', true],
+      [2, `L2_OBR2_${runId}`, '[Demo L2] Plano Obrigatório 2 v1', true],
+      [3, `L2_OPC3_${runId}`, '[Demo L2] Documento Opcional 3 v1', false],
+    ],
+  );
+
+  console.log('✓ Lote 2 (ESP-10/11/12): Catálogo, RPC create_internship_process, snapshot v1/v2, concorrência e isolamento RLS validados');
 }
 
 function apiUrlOr(url) {

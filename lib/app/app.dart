@@ -2,12 +2,18 @@ import 'package:flutter/material.dart';
 
 import '../features/auth/application/auth_controller.dart';
 import '../features/auth/presentation/auth_gate.dart';
+import '../features/processes/domain/process_repository.dart';
 import 'app_theme.dart';
 
 class EstagioSemPendenciaApp extends StatefulWidget {
-  const EstagioSemPendenciaApp({this.authController, super.key});
+  const EstagioSemPendenciaApp({
+    this.authController,
+    this.processRepository,
+    super.key,
+  });
 
   final AuthController? authController;
+  final ProcessRepository? processRepository;
 
   @override
   State<EstagioSemPendenciaApp> createState() => _EstagioSemPendenciaAppState();
@@ -43,7 +49,10 @@ class _EstagioSemPendenciaAppState extends State<EstagioSemPendenciaApp> {
       title: 'Estágio sem Pendência',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
-      home: AuthGate(controller: _controller),
+      home: AuthGate(
+        controller: _controller,
+        processRepository: widget.processRepository,
+      ),
     );
   }
 }

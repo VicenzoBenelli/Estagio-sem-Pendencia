@@ -1,33 +1,92 @@
 import 'package:flutter/material.dart';
 
 import '../../../core/responsive/app_breakpoints.dart';
+import '../../processes/application/process_controller.dart';
+import '../../processes/domain/process_repository.dart';
+import '../../processes/presentation/student_processes_workspace.dart';
 import '../application/auth_controller.dart';
 import '../domain/user_profile.dart';
 
-class StudentHomePage extends StatelessWidget {
+class StudentHomePage extends StatefulWidget {
   const StudentHomePage({
     required this.profile,
     required this.controller,
+    this.processRepository,
     super.key,
   });
 
   final UserProfile profile;
   final AuthController controller;
+  final ProcessRepository? processRepository;
+
+  @override
+  State<StudentHomePage> createState() => _StudentHomePageState();
+}
+
+class _StudentHomePageState extends State<StudentHomePage> {
+  late ProcessController _processController;
+
+  @override
+  void initState() {
+    super.initState();
+    _processController = ProcessController(
+      repository: widget.processRepository,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant StudentHomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.profile.id != widget.profile.id ||
+        oldWidget.processRepository != widget.processRepository) {
+      _processController.clearPrivateState();
+      _processController.dispose();
+      _processController = ProcessController(
+        repository: widget.processRepository,
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _processController.clearPrivateState();
+    _processController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    return _AuthenticatedRoleShell(
-      profile: profile,
-      controller: controller,
-      appBarTitle: 'Estágio sem Pendência — Estudante',
-      badgeLabel: 'Perfil Estudante',
-      badgeIcon: Icons.school_outlined,
-      badgeBackground: colors.primaryContainer,
-      badgeForeground: colors.onPrimaryContainer,
-      scopeTitle: 'Autenticação e sessão de estudante validadas',
-      scopeDescription: 'Este é o painel inicial do estudante para o Lote 1 (ESP-07 a ESP-09). Abertura de processo, checklist versionado e envio privado de PDFs serão habilitados nos próximos lotes.',
-      disclaimer: 'Esta ferramenta não representa autorização institucional de estágio.',
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Estágio sem Pendência — Estudante'),
+        actions: [
+          IconButton(
+            key: const Key('revalidate_session_button'),
+            tooltip: 'Revalidar sessão',
+            onPressed: widget.controller.isBusy
+                ? null
+                : widget.controller.revalidateSession,
+            icon: const Icon(Icons.refresh),
+          ),
+          TextButton.icon(
+            key: const Key('logout_button'),
+            onPressed: widget.controller.isBusy
+                ? null
+                : () {
+                    _processController.clearPrivateState();
+                    widget.controller.signOut();
+                  },
+            icon: const Icon(Icons.logout),
+            label: const Text('Sair'),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: StudentProcessesWorkspace(
+          profile: widget.profile,
+          controller: _processController,
+        ),
+      ),
     );
   }
 }
