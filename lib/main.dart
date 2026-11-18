@@ -5,7 +5,9 @@ import 'app/app.dart';
 import 'core/config/supabase_config.dart';
 import 'features/auth/application/auth_controller.dart';
 import 'features/auth/data/supabase_auth_gateway.dart';
+import 'features/processes/data/supabase_document_repository.dart';
 import 'features/processes/data/supabase_process_repository.dart';
+import 'features/processes/domain/document_repository.dart';
 import 'features/processes/domain/process_repository.dart';
 
 Future<void> main() async {
@@ -14,6 +16,7 @@ Future<void> main() async {
   final config = SupabaseConfig.fromEnvironment();
   AuthController authController;
   ProcessRepository? processRepository;
+  DocumentRepository? documentRepository;
 
   if (config.isConfigured) {
     await Supabase.initialize(
@@ -30,6 +33,7 @@ Future<void> main() async {
       gateway: SupabaseAuthGateway(client, config: config),
     );
     processRepository = SupabaseProcessRepository(client);
+    documentRepository = SupabaseDocumentRepository(client);
   } else {
     authController = AuthController(gateway: null);
   }
@@ -40,6 +44,7 @@ Future<void> main() async {
     EstagioSemPendenciaApp(
       authController: authController,
       processRepository: processRepository,
+      documentRepository: documentRepository,
     ),
   );
 }

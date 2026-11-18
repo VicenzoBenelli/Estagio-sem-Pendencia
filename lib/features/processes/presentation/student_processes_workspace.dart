@@ -4,18 +4,22 @@ import 'package:flutter/material.dart';
 
 import '../../../core/responsive/app_breakpoints.dart';
 import '../../auth/domain/user_profile.dart';
+import '../application/document_submission_controller.dart';
 import '../application/process_controller.dart';
 import '../domain/process_models.dart';
+import 'requirement_documents_section.dart';
 
 class StudentProcessesWorkspace extends StatefulWidget {
   const StudentProcessesWorkspace({
     required this.profile,
     required this.controller,
+    this.documentController,
     super.key,
   });
 
   final UserProfile profile;
   final ProcessController controller;
+  final DocumentSubmissionController? documentController;
 
   @override
   State<StudentProcessesWorkspace> createState() =>
@@ -23,19 +27,51 @@ class StudentProcessesWorkspace extends StatefulWidget {
 }
 
 class _StudentProcessesWorkspaceState extends State<StudentProcessesWorkspace> {
+  ProcessDetailBundle? _lastSyncedDetailBundle;
+
   @override
   void initState() {
     super.initState();
+    widget.controller.addListener(_syncDocumentsIfDetailChanged);
     unawaited(widget.controller.loadDashboard());
   }
 
   @override
   void didUpdateWidget(covariant StudentProcessesWorkspace oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_syncDocumentsIfDetailChanged);
+      widget.controller.addListener(_syncDocumentsIfDetailChanged);
+      _lastSyncedDetailBundle = null;
+    }
+    if (oldWidget.documentController != widget.documentController) {
+      _lastSyncedDetailBundle = null;
+    }
     if (oldWidget.profile.id != widget.profile.id ||
         oldWidget.controller != widget.controller) {
       unawaited(widget.controller.loadDashboard(clearFeedback: true));
     }
+    _syncDocumentsIfDetailChanged();
+  }
+
+  void _syncDocumentsIfDetailChanged() {
+    final docCtrl = widget.documentController;
+    if (docCtrl == null) return;
+    if (widget.controller.subView == StudentProcessSubView.detail &&
+        widget.controller.detailStatus == ProcessLoadStatus.loaded &&
+        widget.controller.detailBundle != null) {
+      final bundle = widget.controller.detailBundle!;
+      if (!identical(bundle, _lastSyncedDetailBundle)) {
+        _lastSyncedDetailBundle = bundle;
+        docCtrl.syncWithProcessDetail(bundle);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_syncDocumentsIfDetailChanged);
+    super.dispose();
   }
 
   @override
@@ -82,6 +118,8 @@ class _StudentProcessesWorkspaceState extends State<StudentProcessesWorkspace> {
                             ),
                           StudentProcessSubView.detail => _ProcessDetailView(
                             controller: widget.controller,
+                            documentController: widget.documentController,
+                            userRole: widget.profile.role,
                             compact: compact,
                           ),
                         },
@@ -753,9 +791,16 @@ class _PublishedTemplateCard extends StatelessWidget {
 }
 
 class _ProcessDetailView extends StatelessWidget {
-  const _ProcessDetailView({required this.controller, required this.compact});
+  const _ProcessDetailView({
+    required this.controller,
+    required this.documentController,
+    required this.userRole,
+    required this.compact,
+  });
 
   final ProcessController controller;
+  final DocumentSubmissionController? documentController;
+  final UserRole userRole;
   final bool compact;
 
   @override
@@ -786,7 +831,13 @@ class _ProcessDetailView extends StatelessWidget {
                   onPressed:
                       controller.detailStatus == ProcessLoadStatus.loading
                       ? null
-                      : controller.refreshActiveDetail,
+                      : () {
+                          unawaited(controller.refreshActiveDetail());
+                          unawaited(
+                            documentController?.reloadExpandedHistories() ??
+                                Future<void>.value(),
+                          );
+                        },
                   icon: const Icon(Icons.refresh),
                   label: const Text('Atualizar checklist'),
                 ),
@@ -822,6 +873,8 @@ class _ProcessDetailView extends StatelessWidget {
                       )
                     : _ProcessDetailLoadedContent(
                         bundle: controller.detailBundle!,
+                        documentController: documentController,
+                        userRole: userRole,
                         textTheme: textTheme,
                         colors: colors,
                       ),
@@ -884,11 +937,15 @@ class _ProcessNotFoundOrDeniedBox extends StatelessWidget {
 class _ProcessDetailLoadedContent extends StatelessWidget {
   const _ProcessDetailLoadedContent({
     required this.bundle,
+    required this.documentController,
+    required this.userRole,
     required this.textTheme,
     required this.colors,
   });
 
   final ProcessDetailBundle bundle;
+  final DocumentSubmissionController? documentController;
+  final UserRole userRole;
   final TextTheme textTheme;
   final ColorScheme colors;
 
@@ -943,13 +1000,22 @@ class _ProcessDetailLoadedContent extends StatelessWidget {
         const SizedBox(height: 16),
         _ProgressOverviewCard(progress: progress),
         const SizedBox(height: 16),
-        _MessageBanner(
-          key: const Key('pdf_upload_future_stage_notice'),
-          icon: Icons.picture_as_pdf_outlined,
-          message: 'O envio privado de documentos PDF será disponibilizado em etapa posterior do MVP. Os status abaixo refletem os registros atuais no servidor.',
-          backgroundColor: colors.surfaceContainerHighest,
-          foregroundColor: colors.onSurfaceVariant,
-        ),
+        if (documentController == null)
+          _MessageBanner(
+            key: const Key('pdf_upload_future_stage_notice'),
+            icon: Icons.picture_as_pdf_outlined,
+            message: 'O envio privado de documentos PDF será disponibilizado em etapa posterior do MVP. Os status abaixo refletem os registros atuais no servidor.',
+            backgroundColor: colors.surfaceContainerHighest,
+            foregroundColor: colors.onSurfaceVariant,
+          )
+        else
+          _MessageBanner(
+            key: const Key('pdf_upload_active_notice'),
+            icon: Icons.picture_as_pdf_outlined,
+            message: 'Envio privado de documentos PDF (máx. 5 MiB): documentos enviados seguem para análise e não representam aprovação ou autorização oficial.',
+            backgroundColor: colors.surfaceContainerHighest,
+            foregroundColor: colors.onSurfaceVariant,
+          ),
         const SizedBox(height: 20),
         Text(
           'Checklist de requisitos (${requirements.length})',
@@ -960,7 +1026,12 @@ class _ProcessDetailLoadedContent extends StatelessWidget {
           const Text('Nenhum requisito encontrado para este processo.')
         else
           for (final item in requirements) ...[
-            _RequirementItemCard(item: item),
+            _RequirementItemCard(
+              item: item,
+              processStatus: process.status,
+              userRole: userRole,
+              documentController: documentController,
+            ),
             const SizedBox(height: 12),
           ],
       ],
@@ -1056,9 +1127,17 @@ class _ProgressOverviewCard extends StatelessWidget {
 }
 
 class _RequirementItemCard extends StatelessWidget {
-  const _RequirementItemCard({required this.item});
+  const _RequirementItemCard({
+    required this.item,
+    required this.processStatus,
+    required this.userRole,
+    required this.documentController,
+  });
 
   final ProcessRequirementItem item;
+  final ProcessStatus processStatus;
+  final UserRole userRole;
+  final DocumentSubmissionController? documentController;
 
   @override
   Widget build(BuildContext context) {
@@ -1129,6 +1208,13 @@ class _RequirementItemCard extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
+            if (documentController != null)
+              RequirementDocumentsSection(
+                item: item,
+                processStatus: processStatus,
+                userRole: userRole,
+                controller: documentController!,
+              ),
           ],
         ),
       ),

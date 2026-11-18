@@ -44,7 +44,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Start local Supabase stack
-        run: npx supabase start --yes -x studio,edge-runtime,imgproxy,logflare,vector,supavisor
+        run: npx supabase start --yes -x studio,imgproxy,logflare,vector,supavisor
       - name: Reset database from scratch (migrations + seed)
         run: npx supabase db reset --yes
       - name: Run pgTAP database & RLS tests

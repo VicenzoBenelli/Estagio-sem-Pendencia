@@ -347,6 +347,57 @@ class ProcessController extends ChangeNotifier {
     await openProcessDetail(id);
   }
 
+  /// Atualiza detalhes apenas do processo alterado e sincroniza progresso na lista.
+  Future<void> refreshAfterDocumentUpdate(String processId) async {
+    final repo = repository;
+    if (repo == null || _disposed) return;
+
+    if (_activeDetailProcessId == processId) {
+      final currentDetailEpoch = ++_detailEpoch;
+      try {
+        final detail = await repo.fetchProcessDetail(processId: processId);
+        if (_disposed ||
+            currentDetailEpoch != _detailEpoch ||
+            _activeDetailProcessId != processId) {
+          return;
+        }
+        if (detail == null) {
+          _detailBundle = null;
+          _detailNotFoundOrDenied = true;
+          _detailStatus = ProcessLoadStatus.loaded;
+        } else {
+          _detailBundle = detail;
+          _detailNotFoundOrDenied = false;
+          _detailStatus = ProcessLoadStatus.loaded;
+        }
+        _safeNotify();
+      } catch (_) {
+        // Preserva detalhes atuais e feedback de submissão se falhar recarga silenciosa.
+      }
+    }
+
+    final currentListEpoch = ++_listEpoch;
+    _listRequestInFlight = true;
+    try {
+      final refreshedList = await repo.fetchStudentProcesses();
+      if (_disposed || currentListEpoch != _listEpoch) return;
+      _listRequestInFlight = false;
+      _processes = refreshedList;
+      _listStatus = ProcessLoadStatus.loaded;
+      _listErrorMessage = null;
+      _safeNotify();
+    } catch (error) {
+      if (_disposed || currentListEpoch != _listEpoch) return;
+      _listRequestInFlight = false;
+      if (_listStatus != ProcessLoadStatus.loaded) {
+        final failure = SupabaseProcessRepository.mapError(error);
+        _listErrorMessage = failure.message;
+        _listStatus = ProcessLoadStatus.error;
+      }
+      _safeNotify();
+    }
+  }
+
   void returnToDashboard() {
     _subView = StudentProcessSubView.dashboard;
     _createErrorMessage = null;

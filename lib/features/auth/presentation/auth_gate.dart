@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../../core/responsive/app_breakpoints.dart';
+import '../../processes/domain/document_repository.dart';
 import '../../processes/domain/process_repository.dart';
 import '../application/auth_controller.dart';
 import 'auth_screen.dart';
@@ -8,10 +9,18 @@ import 'reset_password_page.dart';
 import 'role_home_pages.dart';
 
 class AuthGate extends StatelessWidget {
-  const AuthGate({required this.controller, this.processRepository, super.key});
+  const AuthGate({
+    required this.controller,
+    this.processRepository,
+    this.documentRepository,
+    this.pdfPickerGateway,
+    super.key,
+  });
 
   final AuthController controller;
   final ProcessRepository? processRepository;
+  final DocumentRepository? documentRepository;
+  final PdfPickerGateway? pdfPickerGateway;
 
   @override
   Widget build(BuildContext context) {
@@ -44,6 +53,8 @@ class AuthGate extends StatelessWidget {
             profile: profile!,
             controller: controller,
             processRepository: processRepository,
+            documentRepository: documentRepository,
+            pdfPickerGateway: pdfPickerGateway,
           ),
           AuthViewStatus.authenticatedReviewer => ReviewerHomePage(
             key: ValueKey('reviewer_home_${profile?.id ?? ''}'),

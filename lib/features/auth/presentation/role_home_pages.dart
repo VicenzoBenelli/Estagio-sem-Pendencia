@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../../../core/responsive/app_breakpoints.dart';
+import '../../processes/application/document_submission_controller.dart';
 import '../../processes/application/process_controller.dart';
+import '../../processes/data/file_picker_pdf_gateway.dart';
+import '../../processes/domain/document_repository.dart';
 import '../../processes/domain/process_repository.dart';
 import '../../processes/presentation/student_processes_workspace.dart';
 import '../application/auth_controller.dart';
@@ -12,12 +15,16 @@ class StudentHomePage extends StatefulWidget {
     required this.profile,
     required this.controller,
     this.processRepository,
+    this.documentRepository,
+    this.pdfPickerGateway,
     super.key,
   });
 
   final UserProfile profile;
   final AuthController controller;
   final ProcessRepository? processRepository;
+  final DocumentRepository? documentRepository;
+  final PdfPickerGateway? pdfPickerGateway;
 
   @override
   State<StudentHomePage> createState() => _StudentHomePageState();
@@ -25,32 +32,52 @@ class StudentHomePage extends StatefulWidget {
 
 class _StudentHomePageState extends State<StudentHomePage> {
   late ProcessController _processController;
+  DocumentSubmissionController? _documentController;
 
   @override
   void initState() {
     super.initState();
+    _initControllers();
+  }
+
+  void _initControllers() {
     _processController = ProcessController(
       repository: widget.processRepository,
     );
+    _documentController = widget.documentRepository == null
+        ? null
+        : DocumentSubmissionController(
+            repository: widget.documentRepository,
+            pickerGateway:
+                widget.pdfPickerGateway ?? const FilePickerPdfGateway(),
+            onSubmissionCommitted:
+                _processController.refreshAfterDocumentUpdate,
+          );
   }
 
   @override
   void didUpdateWidget(covariant StudentHomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.profile.id != widget.profile.id ||
-        oldWidget.processRepository != widget.processRepository) {
-      _processController.clearPrivateState();
-      _processController.dispose();
-      _processController = ProcessController(
-        repository: widget.processRepository,
-      );
+        oldWidget.processRepository != widget.processRepository ||
+        oldWidget.documentRepository != widget.documentRepository ||
+        oldWidget.pdfPickerGateway != widget.pdfPickerGateway) {
+      _disposeControllers();
+      _initControllers();
     }
+  }
+
+  void _disposeControllers() {
+    _documentController?.clearPrivateState();
+    _documentController?.dispose();
+    _documentController = null;
+    _processController.clearPrivateState();
+    _processController.dispose();
   }
 
   @override
   void dispose() {
-    _processController.clearPrivateState();
-    _processController.dispose();
+    _disposeControllers();
     super.dispose();
   }
 
@@ -73,6 +100,7 @@ class _StudentHomePageState extends State<StudentHomePage> {
             onPressed: widget.controller.isBusy
                 ? null
                 : () {
+                    _documentController?.clearPrivateState();
                     _processController.clearPrivateState();
                     widget.controller.signOut();
                   },
@@ -85,6 +113,7 @@ class _StudentHomePageState extends State<StudentHomePage> {
         child: StudentProcessesWorkspace(
           profile: widget.profile,
           controller: _processController,
+          documentController: _documentController,
         ),
       ),
     );

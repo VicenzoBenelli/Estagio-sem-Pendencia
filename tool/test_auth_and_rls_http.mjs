@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 const DEMO_INSTITUTION_ID = '10000000-0000-4000-8000-000000000001';
 const ANDROID_CALLBACK_URL = 'estagiosempendencia://auth/callback';
@@ -937,6 +938,17 @@ async function main() {
       sensitivePool,
     });
 
+    // ========================================================================
+    // LOTE 3 (ESP-13 / ESP-14 / ESP-15): Storage privado, Edge Upload e Versões
+    // ========================================================================
+    await runLote3StorageAndSubmissionScenarios({
+      env,
+      runId,
+      clientHeaders,
+      serviceHeaders,
+      sensitivePool,
+    });
+
     console.log('\nTODOS OS CENÁRIOS HTTP/AUTH/RLS E HARDENING PASSARAM COM SUCESSO.');
   } catch (err) {
     const safeMessage = redactKnownSecrets(err?.message ?? String(err), sensitivePool);
@@ -1607,6 +1619,1847 @@ async function runLote2ProcessAndChecklistScenarios({
   );
 
   console.log('✓ Lote 2 (ESP-10/11/12): Catálogo, RPC create_internship_process, snapshot v1/v2, concorrência e isolamento RLS validados');
+}
+
+function buildValidMinimalPdfBytes(labelText = 'Estagio Sem Pendencia Demo PDF') {
+  const safeLabel = labelText.replace(/[()\\]/g, ' ');
+  const streamContent = `BT\n/F1 12 Tf\n72 720 Td\n(${safeLabel}) Tj\nET\n`;
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n',
+    `4 0 obj\n<< /Length ${Buffer.byteLength(streamContent, 'latin1')} >>\nstream\n${streamContent}endstream\nendobj\n`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+
+  const chunks = ['%PDF-1.4\n'];
+  const offsets = [0];
+  let byteOffset = Buffer.byteLength(chunks[0], 'latin1');
+
+  for (const obj of objects) {
+    offsets.push(byteOffset);
+    chunks.push(obj);
+    byteOffset += Buffer.byteLength(obj, 'latin1');
+  }
+
+  const xrefOffset = byteOffset;
+  let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i < offsets.length; i++) {
+    xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+
+  const trailer = `${xref}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  chunks.push(trailer);
+  return Buffer.from(chunks.join(''), 'latin1');
+}
+
+function buildSolTruncated142PdfBytes() {
+  const header = '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const trailer = 'xref\n0 2\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n999999999\n%%EOF\n';
+  const baseLen = Buffer.byteLength(header + trailer, 'latin1');
+  const padLen = Math.max(0, 142 - baseLen);
+  const commentPad = padLen >= 2 ? `%${' '.repeat(padLen - 2)}\n` : '';
+  return Buffer.from(header + commentPad + trailer, 'latin1');
+}
+
+function buildFakeInBoundsStartxrefPdfBytes() {
+  return Buffer.from(
+    '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n' +
+      '2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\nstartxref\n9\n%%EOF\n',
+    'latin1',
+  );
+}
+
+function buildValidXrefStreamPdfBytes(labelText = 'Estagio PDF 1.5 XRef Stream') {
+  const safeLabel = labelText.replace(/[()\\]/g, ' ');
+  const streamContent = `BT\n/F1 12 Tf\n72 720 Td\n(${safeLabel}) Tj\nET\n`;
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n',
+    `4 0 obj\n<< /Length ${Buffer.byteLength(streamContent, 'latin1')} >>\nstream\n${streamContent}endstream\nendobj\n`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+
+  const chunks = [Buffer.from('%PDF-1.5\n', 'latin1')];
+  const offsets = [0];
+  let byteOffset = chunks[0].byteLength;
+
+  for (const obj of objects) {
+    offsets.push(byteOffset);
+    const buf = Buffer.from(obj, 'latin1');
+    chunks.push(buf);
+    byteOffset += buf.byteLength;
+  }
+
+  const xrefStreamOffset = byteOffset;
+  offsets.push(xrefStreamOffset);
+
+  const xrefEntries = Buffer.alloc(offsets.length * 4);
+  // Entrada 0: objeto livre
+  xrefEntries[0] = 0;
+  xrefEntries[1] = 0;
+  xrefEntries[2] = 0;
+  xrefEntries[3] = 255;
+  for (let i = 1; i < offsets.length; i++) {
+    const off = offsets[i];
+    const base = i * 4;
+    xrefEntries[base] = 1;
+    xrefEntries[base + 1] = (off >> 8) & 0xff;
+    xrefEntries[base + 2] = off & 0xff;
+    xrefEntries[base + 3] = 0;
+  }
+
+  const xrefHeader = Buffer.from(
+    `6 0 obj\n<< /Type /XRef /Size ${offsets.length} /Root 1 0 R /W [1 2 1] /Length ${xrefEntries.byteLength} >>\nstream\n`,
+    'latin1',
+  );
+  const xrefFooter = Buffer.from(
+    `\nendstream\nendobj\nstartxref\n${xrefStreamOffset}\n%%EOF\n`,
+    'latin1',
+  );
+
+  return Buffer.concat([...chunks, xrefHeader, xrefEntries, xrefFooter]);
+}
+
+function buildC303R1MissingStreamXrefPdfBytes() {
+  const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const obj2Body = 'BT /F1 12 Tf 72 720 Td (Objeto stream anterior isolado) Tj ET';
+  const obj2 = `2 0 obj\n<< /Length ${Buffer.byteLength(obj2Body, 'latin1')} >>\nstream\n${obj2Body}\nendstream\nendobj\n`;
+  const prefix = `%PDF-1.5\n${obj1}${obj2}`;
+  const xrefObjOffset = Buffer.byteLength(prefix, 'latin1');
+  const fakeXrefObj =
+    '3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 2 1] /Length 28 >>\nendobj\n';
+  return Buffer.from(`${prefix}${fakeXrefObj}startxref\n${xrefObjOffset}\n%%EOF\n`, 'latin1');
+}
+
+function buildC303R2IncompleteStreamXrefPdfBytes({ withTrailingPadding = false } = {}) {
+  const prefix = '%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const xrefObjOffset = Buffer.byteLength(prefix, 'latin1');
+  const shortData = Buffer.alloc(10, 0x41);
+  const padComment = withTrailingPadding ? `%${' '.repeat(48)}\n` : '';
+  return Buffer.concat([
+    Buffer.from(
+      `${prefix}2 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /W [1 2 1] /Length 28 >>\nstream\n`,
+      'latin1',
+    ),
+    shortData,
+    Buffer.from(`\nendstream\nendobj\n${padComment}startxref\n${xrefObjOffset}\n%%EOF\n`, 'latin1'),
+  ]);
+}
+
+function buildC303R3MissingEndstreamXrefPdfBytes({ lateEndstream = false } = {}) {
+  const prefix = '%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const xrefObjOffset = Buffer.byteLength(prefix, 'latin1');
+  const data28 = Buffer.alloc(28, 0x01);
+  const tail = lateEndstream
+    ? '\nEXTRA_DESALINHADO\nendstream\nendobj\n'
+    : '\nendobj\n';
+  return Buffer.concat([
+    Buffer.from(
+      `${prefix}2 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /W [1 2 1] /Length 28 >>\nstream\n`,
+      'latin1',
+    ),
+    data28,
+    Buffer.from(`${tail}startxref\n${xrefObjOffset}\n%%EOF\n`, 'latin1'),
+  ]);
+}
+
+function buildC303IndirectLengthXrefPdfBytes() {
+  const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const obj2 = '2 0 obj\n28\nendobj\n';
+  const prefix = `%PDF-1.5\n${obj1}${obj2}`;
+  const xrefObjOffset = Buffer.byteLength(prefix, 'latin1');
+  const data28 = Buffer.alloc(28, 0x02);
+  return Buffer.concat([
+    Buffer.from(
+      `${prefix}3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 2 1] /Length 2 0 R >>\nstream\n`,
+      'latin1',
+    ),
+    data28,
+    Buffer.from(`\nendstream\nendobj\nstartxref\n${xrefObjOffset}\n%%EOF\n`, 'latin1'),
+  ]);
+}
+
+function buildValidFlateXrefStreamPdfBytes(labelText = 'Estagio PDF 1.5 FlateDecode XRef') {
+  const safeLabel = labelText.replace(/[()\\]/g, ' ');
+  const streamContent = `BT\n/F1 12 Tf\n72 720 Td\n(${safeLabel}) Tj\nET\n`;
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n',
+    `4 0 obj\n<< /Length ${Buffer.byteLength(streamContent, 'latin1')} >>\nstream\n${streamContent}endstream\nendobj\n`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+
+  const chunks = [Buffer.from('%PDF-1.5\n', 'latin1')];
+  const offsets = [0];
+  let byteOffset = chunks[0].byteLength;
+
+  for (const obj of objects) {
+    offsets.push(byteOffset);
+    const buf = Buffer.from(obj, 'latin1');
+    chunks.push(buf);
+    byteOffset += buf.byteLength;
+  }
+
+  const xrefStreamOffset = byteOffset;
+  offsets.push(xrefStreamOffset);
+
+  const rawEntries = Buffer.alloc(offsets.length * 4);
+  rawEntries[0] = 0;
+  rawEntries[1] = 0;
+  rawEntries[2] = 0;
+  rawEntries[3] = 255;
+  for (let i = 1; i < offsets.length; i++) {
+    const off = offsets[i];
+    const base = i * 4;
+    rawEntries[base] = 1;
+    rawEntries[base + 1] = (off >> 8) & 0xff;
+    rawEntries[base + 2] = off & 0xff;
+    rawEntries[base + 3] = 0;
+  }
+
+  const compressed = zlib.deflateSync(rawEntries);
+  const xrefHeader = Buffer.from(
+    `6 0 obj<</DecodeParms<</Columns 4/Predictor 1>>/Filter/FlateDecode/Length ${compressed.byteLength}/Root 1 0 R/Size ${offsets.length}/Type/XRef/W[1 2 1]>>stream\r\n`,
+    'latin1',
+  );
+  const xrefFooter = Buffer.from(
+    `\r\nendstream\r\nendobj\r\nstartxref\r\n${xrefStreamOffset}\r\n%%EOF\r\n`,
+    'latin1',
+  );
+
+  return Buffer.concat([...chunks, xrefHeader, compressed, xrefFooter]);
+}
+
+async function httpEdgeSubmitPdf({
+  apiUrl,
+  anonKey,
+  token,
+  processRequirementId,
+  idempotencyKey,
+  fileBytes,
+  filename = 'documento.pdf',
+  mimeType = 'application/pdf',
+  signal,
+}) {
+  const formData = new FormData();
+  if (processRequirementId !== undefined && processRequirementId !== null) {
+    formData.append('process_requirement_id', processRequirementId);
+  }
+  if (idempotencyKey) {
+    formData.append('idempotency_key', idempotencyKey);
+  }
+  if (fileBytes !== null && fileBytes !== undefined) {
+    const blob = new Blob([fileBytes], { type: mimeType });
+    formData.append('file', blob, filename);
+  }
+
+  const headers = {
+    apikey: anonKey,
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${apiUrl}/functions/v1/submit-requirement-pdf`, {
+    method: 'POST',
+    headers,
+    body: formData,
+    signal,
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+    text,
+  };
+}
+
+async function httpRawBytes(url, { method = 'GET', headers = {}, body } = {}) {
+  const response = await fetch(url, { method, headers, body });
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  return {
+    ok: response.ok,
+    status: response.status,
+    headers: response.headers,
+    buffer,
+    text: buffer.toString('utf8'),
+  };
+}
+
+function encodeStoragePathSegments(storagePath) {
+  return storagePath
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+async function runLote3StorageAndSubmissionScenarios({
+  env,
+  runId,
+  clientHeaders,
+  serviceHeaders,
+  sensitivePool,
+}) {
+  const passE = `DemoE!${crypto.randomBytes(8).toString('hex')}`;
+  const passF = `DemoF!${crypto.randomBytes(8).toString('hex')}`;
+  const passR5 = `DemoR5!${crypto.randomBytes(8).toString('hex')}`;
+  const passR6 = `DemoR6!${crypto.randomBytes(8).toString('hex')}`;
+
+  const studentE = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `estudante.e.l3.${runId}@demo.local`,
+    password: passE,
+    fullName: 'Estudante E Lote 3 HTTP',
+  });
+  const studentF = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `estudante.f.l3.${runId}@demo.local`,
+    password: passF,
+    fullName: 'Estudante F Lote 3 HTTP',
+  });
+  const reviewerR5 = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `revisor.r5.l3.${runId}@demo.local`,
+    password: passR5,
+    fullName: 'Revisor R5 Atribuido Lote 3 HTTP',
+  });
+  const reviewerR6 = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `revisor.r6.l3.${runId}@demo.local`,
+    password: passR6,
+    fullName: 'Revisor R6 Sem Escopo Lote 3 HTTP',
+  });
+
+  for (const rev of [reviewerR5, reviewerR6]) {
+    const promote = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_set_user_role`, {
+      method: 'POST',
+      headers: serviceHeaders,
+      body: {
+        p_user_id: rev.id,
+        p_new_role: 'reviewer',
+        p_operator_type: OPERATOR_TYPE,
+        p_operator_identifier: OPERATOR_IDENTIFIER,
+        p_reason: 'Provisionamento Lote 3 HTTP',
+      },
+    });
+    assert.equal(promote.status, 200, `Erro promovendo revisor L3: ${sanitizeHttpSummary(promote)}`);
+  }
+
+  const catA = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `L3_A_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L3_TCE_${runId}`,
+        title: '[Demo L3] Termo de Compromisso',
+        description: 'Enviar TCE assinado',
+        acceptanceCriteria: 'PDF válido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+      {
+        code: `L3_PAE_${runId}`,
+        title: '[Demo L3] Plano Opcional',
+        description: 'Enviar plano opcional',
+        acceptanceCriteria: 'PDF válido',
+        isRequired: false,
+        displayOrder: 2,
+      },
+    ],
+  });
+
+  const catOther = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `L3_B_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L3_OTHER_${runId}`,
+        title: '[Demo L3] Outro Documento',
+        description: 'Outro requisito',
+        acceptanceCriteria: 'PDF válido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  // Atribuir R5 apenas a catA e R6 apenas a catOther
+  const assignR5 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerR5.id,
+      p_institution_id: catA.institutionId,
+      p_course_id: catA.courseId,
+      p_course_modality_id: catA.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L3 para R5',
+    },
+  });
+  assert.equal(assignR5.status, 200, `Erro atribuindo R5: ${sanitizeHttpSummary(assignR5)}`);
+  const r5AssignmentId = assignR5.data.id;
+
+  const assignR6 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerR6.id,
+      p_institution_id: catOther.institutionId,
+      p_course_id: catOther.courseId,
+      p_course_modality_id: catOther.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L3 para R6',
+    },
+  });
+  assert.equal(assignR6.status, 200, `Erro atribuindo R6: ${sanitizeHttpSummary(assignR6)}`);
+
+  // Abrir processos para Estudante E e Estudante F na modalidade catA
+  const openE = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentE.token),
+    body: { p_course_modality_id: catA.modalityId },
+  });
+  assert.equal(openE.status, 200, `Erro abrindo processo E L3: ${sanitizeHttpSummary(openE)}`);
+  const procEId = openE.data.id;
+
+  const openF = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentF.token),
+    body: { p_course_modality_id: catA.modalityId },
+  });
+  assert.equal(openF.status, 200, `Erro abrindo processo F L3: ${sanitizeHttpSummary(openF)}`);
+  const procFId = openF.data.id;
+
+  const reqsERes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procEId}&order=display_order.asc`,
+    { headers: clientHeaders(studentE.token) },
+  );
+  assert.equal(reqsERes.status, 200);
+  assert.equal(reqsERes.data.length, 2);
+  const reqEReq = reqsERes.data[0];
+  const reqEOpt = reqsERes.data[1];
+
+  const reqsFRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procFId}&order=display_order.asc`,
+    { headers: clientHeaders(studentF.token) },
+  );
+  assert.equal(reqsFRes.status, 200);
+  const reqFReq = reqsFRes.data[0];
+  const reqFOpt = reqsFRes.data[1];
+
+  // 1) CORS OPTIONS preflight (Flutter Web) e verificação do bucket privado
+  const corsPreflight = await fetch(`${env.apiUrl}/functions/v1/submit-requirement-pdf`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'http://localhost:8080',
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'authorization, apikey, content-type',
+    },
+  });
+  assert.ok(
+    corsPreflight.status === 200 || corsPreflight.status === 204,
+    `Preflight OPTIONS na Edge Function devia retornar 200 ou 204 (recebido ${corsPreflight.status})`,
+  );
+  assert.equal(corsPreflight.headers.get('access-control-allow-origin'), '*');
+
+  const bucketInfo = await httpJson(`${env.apiUrl}/storage/v1/bucket/internship-documents`, {
+    headers: serviceHeaders,
+  });
+  assert.equal(bucketInfo.status, 200, `Bucket internship-documents ausente: ${sanitizeHttpSummary(bucketInfo)}`);
+  assert.equal(bucketInfo.data.public, false, 'Bucket internship-documents precisa ter public = false');
+
+  // 2) Anônimo e JWT inválido/expirado/revogado rejeitados na Edge Function
+  const pdfV1Bytes = buildValidMinimalPdfBytes(`TCE Versao 1 ${runId}`);
+  const pdfV1Sha256 = crypto.createHash('sha256').update(pdfV1Bytes).digest('hex');
+
+  const anonEdgeAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: null,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+  });
+  assert.equal(anonEdgeAttempt.status, 401, `Envio anônimo devia retornar 401: ${anonEdgeAttempt.status}`);
+
+  const badJwtAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: 'invalid.jwt.token',
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+  });
+  assert.equal(badJwtAttempt.status, 401, `JWT inválido devia retornar 401: ${badJwtAttempt.status}`);
+
+  // 3) Validações negativas de arquivo antes de gravar Storage ou banco
+  const emptyPdfAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: Buffer.alloc(0),
+    filename: 'vazio.pdf',
+  });
+  assert.equal(emptyPdfAttempt.status, 400);
+  assert.equal(emptyPdfAttempt.data?.error?.code, 'empty_file');
+
+  const txtRenamedAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: Buffer.from('Conteudo texto simples disfarçado de PDF com mais de 64 bytes para testar assinatura.', 'utf8'),
+    filename: 'disfarce_txt.pdf',
+    mimeType: 'application/pdf',
+  });
+  assert.equal(txtRenamedAttempt.status, 422);
+  assert.equal(txtRenamedAttempt.data?.error?.code, 'invalid_pdf_signature');
+
+  const pngBytes = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(128, 0x41),
+  ]);
+  const pngRenamedAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pngBytes,
+    filename: 'imagem_falsa.pdf',
+    mimeType: 'application/pdf',
+  });
+  assert.equal(pngRenamedAttempt.status, 422);
+  assert.equal(pngRenamedAttempt.data?.error?.code, 'invalid_pdf_signature');
+
+  const wrongMimeAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+    filename: 'valido_mas_mime_errado.pdf',
+    mimeType: 'image/png',
+  });
+  assert.equal(wrongMimeAttempt.status, 415);
+  assert.equal(wrongMimeAttempt.data?.error?.code, 'unsupported_media_type');
+
+  const wrongExtAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+    filename: 'contrato.txt',
+    mimeType: 'application/pdf',
+  });
+  assert.equal(wrongExtAttempt.status, 400);
+  assert.equal(wrongExtAttempt.data?.error?.code, 'invalid_file_extension');
+
+  const truncatedPdfAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes.subarray(0, pdfV1Bytes.length - 25),
+    filename: 'truncado.pdf',
+  });
+  assert.equal(truncatedPdfAttempt.status, 422);
+  assert.equal(truncatedPdfAttempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+
+  // Regressão C3-03: arquivo inválido de 142 bytes com startxref=999999999 e ponteiro falso rejeitados antes do Storage/banco
+  const solTruncated142 = buildSolTruncated142PdfBytes();
+  assert.equal(solTruncated142.byteLength, 142);
+  const solTruncatedAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: solTruncated142,
+    filename: 'repro_sol_142b_startxref_invalido.pdf',
+  });
+  assert.equal(
+    solTruncatedAttempt.status,
+    422,
+    `PDF de 142 bytes com startxref=999999999 devia retornar 422 (recebido ${solTruncatedAttempt.status}: ${solTruncatedAttempt.text})`,
+  );
+  assert.equal(solTruncatedAttempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+
+  const fakeInBoundsAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: buildFakeInBoundsStartxrefPdfBytes(),
+    filename: 'startxref_apontando_para_obj.pdf',
+  });
+  assert.equal(fakeInBoundsAttempt.status, 422);
+  assert.equal(fakeInBoundsAttempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+
+  const oversizedPdfBytes = Buffer.concat([
+    pdfV1Bytes,
+    Buffer.alloc(5 * 1024 * 1024 + 128, 0x20),
+  ]);
+  const oversizedAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: oversizedPdfBytes,
+    filename: 'muito_grande.pdf',
+  });
+  assert.equal(oversizedAttempt.status, 413);
+  assert.equal(oversizedAttempt.data?.error?.code, 'file_too_large');
+
+  // Rejeição de outro estudante (Estudante F tentando enviar para requisito de Estudante E)
+  const crossStudentSubmit = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentF.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+    filename: 'invasao.pdf',
+  });
+  assert.equal(crossStudentSubmit.status, 403);
+  assert.equal(crossStudentSubmit.data?.error?.code, 'forbidden_owner');
+
+  // Rejeição de revisor tentando submeter no lugar do estudante
+  const reviewerSubmit = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerR5.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: pdfV1Bytes,
+    filename: 'revisor.pdf',
+  });
+  assert.equal(reviewerSubmit.status, 403);
+  assert.equal(reviewerSubmit.data?.error?.code, 'forbidden_role');
+
+  // Bloquear escrita direta pelo cliente no Storage e PostgREST
+  const directStorageWrite = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/direct/${runId}.pdf`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+        'Content-Type': 'application/pdf',
+      },
+      body: pdfV1Bytes,
+    },
+  );
+  assert.equal(directStorageWrite.ok, false, `Upload direto ao Storage devia falhar: HTTP ${directStorageWrite.status}`);
+
+  const directDbInsert = await httpJson(`${env.apiUrl}/rest/v1/document_submissions`, {
+    method: 'POST',
+    headers: clientHeaders(studentE.token),
+    body: {
+      process_id: procEId,
+      process_requirement_id: reqEReq.id,
+      submitted_by: studentE.id,
+      version: 1,
+      storage_path: `bypass/${runId}.pdf`,
+      mime_type: 'application/pdf',
+      size_bytes: pdfV1Bytes.byteLength,
+    },
+  });
+  assert.equal(directDbInsert.ok, false, 'INSERT direto em document_submissions pelo cliente deve ser bloqueado');
+
+  // Confirmar zero submissões antes do primeiro envio válido
+  const preSubsCheck = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqEReq.id}`,
+    { headers: clientHeaders(studentE.token) },
+  );
+  assert.equal(preSubsCheck.data.length, 0);
+
+  // 4) Envio válido v1 com idempotency_key via Edge Function + caminho opaco sem PII
+  const idemV1Key = crypto.randomUUID();
+  const submitV1 = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    idempotencyKey: idemV1Key,
+    fileBytes: pdfV1Bytes,
+    filename: 'C:\\fakepath\\Estudante_E_CPF123_Termo.pdf',
+  });
+  assert.equal(submitV1.status, 201, `Upload v1 válido falhou: HTTP ${submitV1.status} ${submitV1.text}`);
+  assert.equal(submitV1.data.ok, true);
+  assert.equal(submitV1.data.idempotent_replay, false);
+  const subV1 = submitV1.data.submission;
+  assert.equal(subV1.version, 1);
+  assert.equal(subV1.status, 'under_review');
+  assert.equal(subV1.sha256_checksum, pdfV1Sha256);
+  assert.equal(subV1.size_bytes, pdfV1Bytes.byteLength);
+  assert.equal(subV1.storage_bucket, 'internship-documents');
+  assert.equal(subV1.original_filename, 'Estudante_E_CPF123_Termo.pdf');
+  assert.match(
+    subV1.storage_path,
+    new RegExp(`^processes/${procEId}/requirements/${reqEReq.id}/submissions/[0-9a-f-]{36}\\.pdf$`),
+  );
+  assert.equal(subV1.storage_path.toLowerCase().includes('estudante'), false);
+  assert.equal(subV1.storage_path.toLowerCase().includes('cpf'), false);
+  assert.equal(subV1.storage_path.toLowerCase().includes('demo.local'), false);
+
+  // 5) Retry idempotente não cria v2 nem duplica objeto; mesma chave com outro payload falha (409)
+  const retryV1 = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    idempotencyKey: idemV1Key,
+    fileBytes: pdfV1Bytes,
+    filename: 'Estudante_E_CPF123_Termo.pdf',
+  });
+  assert.equal(retryV1.status, 200, `Retry idempotente devia retornar 200: ${retryV1.status} ${retryV1.text}`);
+  assert.equal(retryV1.data.idempotent_replay, true);
+  assert.equal(retryV1.data.submission.id, subV1.id);
+  assert.equal(retryV1.data.submission.storage_path, subV1.storage_path);
+
+  const mismatchIdem = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    idempotencyKey: idemV1Key,
+    fileBytes: buildValidMinimalPdfBytes(`Outro Conteudo ${runId}`),
+    filename: 'outro.pdf',
+  });
+  assert.equal(mismatchIdem.status, 409);
+  assert.equal(mismatchIdem.data?.error?.code, 'idempotency_mismatch');
+
+  // Novo envio sem reabrir para correção deve falhar enquanto under_review
+  const dupWhileUnderReview = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`Tentativa Bloqueada ${runId}`),
+    filename: 'novo.pdf',
+  });
+  assert.equal(dupWhileUnderReview.status, 409);
+  assert.equal(dupWhileUnderReview.data?.error?.code, 'requirement_status_conflict');
+
+  // 6) Controle de acesso ao Storage privado (URL pública, anon, dono, outro estudante, R5, R6 e revogação R5)
+  const encodedV1Path = encodeStoragePathSegments(subV1.storage_path);
+
+  const publicUrlRead = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/public/internship-documents/${encodedV1Path}`,
+  );
+  assert.equal(publicUrlRead.ok, false, `Bucket privado nunca pode responder via URL pública (${publicUrlRead.status})`);
+
+  const anonStorageRead = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    { headers: { apikey: env.anonKey } },
+  );
+  assert.equal(anonStorageRead.ok, false, `Anon não pode baixar PDF privado (${anonStorageRead.status})`);
+
+  // Dono E baixa via endpoint padrão do storage_client (/object/<bucket>/<path>) e /object/authenticated/
+  const ownerDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+      },
+    },
+  );
+  assert.equal(ownerDownload.status, 200, `Estudante dono E devia baixar v1: HTTP ${ownerDownload.status}`);
+  assert.equal(Buffer.compare(ownerDownload.buffer, pdfV1Bytes), 0, 'Bytes baixados pelo dono devem ser idênticos aos enviados');
+
+  const ownerAuthDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+      },
+    },
+  );
+  assert.equal(ownerAuthDownload.status, 200, `Estudante dono E devia baixar v1 via /authenticated/: HTTP ${ownerAuthDownload.status}`);
+  assert.equal(Buffer.compare(ownerAuthDownload.buffer, pdfV1Bytes), 0);
+
+  // Regressão C3-01: usuários comuns (inclusive dono e revisor atribuído) NÃO podem gerar URLs assinadas
+  const ownerSignRes = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedV1Path}`,
+    {
+      method: 'POST',
+      headers: clientHeaders(studentE.token),
+      body: { expiresIn: 315360000 },
+    },
+  );
+  assert.equal(
+    ownerSignRes.ok,
+    false,
+    `Dono authenticated não pode gerar signed URL (recebido ${ownerSignRes.status}: ${ownerSignRes.text})`,
+  );
+
+  const ownerSignManyRes = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents`,
+    {
+      method: 'POST',
+      headers: clientHeaders(studentE.token),
+      body: { expiresIn: 315360000, paths: [subV1.storage_path] },
+    },
+  );
+  assert.equal(
+    !ownerSignManyRes.ok ||
+      (Array.isArray(ownerSignManyRes.data) &&
+        ownerSignManyRes.data.every((item) => item && item.signedURL === null && Boolean(item.error))),
+    true,
+    `Dono authenticated não pode obter signed URL em lote (recebido ${ownerSignManyRes.status}: ${ownerSignManyRes.text})`,
+  );
+
+  // Estudante F mesmo conhecendo storage_path exato é bloqueado no download e no sign
+  const otherStudentDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentF.token}`,
+      },
+    },
+  );
+  assert.equal(otherStudentDownload.ok, false, `Estudante F não pode baixar PDF de E (${otherStudentDownload.status})`);
+
+  const otherStudentSign = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedV1Path}`,
+    {
+      method: 'POST',
+      headers: clientHeaders(studentF.token),
+      body: { expiresIn: 60 },
+    },
+  );
+  assert.equal(otherStudentSign.ok, false, 'Estudante F não pode gerar signedURL para PDF de E');
+
+  // Revisor R5 no escopo lê PDF v1 autenticado, mas é proibido de gerar signed URL (10 anos ou 60s)
+  const r5SignRes = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedV1Path}`,
+    {
+      method: 'POST',
+      headers: clientHeaders(reviewerR5.token),
+      body: { expiresIn: 315360000 },
+    },
+  );
+  assert.equal(
+    r5SignRes.ok,
+    false,
+    `Revisor R5 não pode emitir signed URL de longa duração (${r5SignRes.status}: ${r5SignRes.text})`,
+  );
+
+  const r5SignManyRes = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents`,
+    {
+      method: 'POST',
+      headers: clientHeaders(reviewerR5.token),
+      body: { expiresIn: 315360000, paths: [subV1.storage_path] },
+    },
+  );
+  assert.equal(
+    !r5SignManyRes.ok ||
+      (Array.isArray(r5SignManyRes.data) &&
+        r5SignManyRes.data.every((item) => item && item.signedURL === null && Boolean(item.error))),
+    true,
+    `Revisor R5 não pode obter signed URL em lote (recebido ${r5SignManyRes.status}: ${r5SignManyRes.text})`,
+  );
+
+  const r5Download = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerR5.token}`,
+      },
+    },
+  );
+  assert.equal(r5Download.status, 200, `Revisor atribuído R5 devia baixar PDF v1 (${r5Download.status})`);
+  assert.equal(Buffer.compare(r5Download.buffer, pdfV1Bytes), 0);
+
+  const r6Download = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerR6.token}`,
+      },
+    },
+  );
+  assert.equal(r6Download.ok, false, `Revisor sem assignment no escopo R6 não pode baixar PDF v1 (${r6Download.status})`);
+
+  // Revogar assignment de R5 bloqueia novos acessos autenticados e sign imediatamente
+  const revokeR5 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_revoke_reviewer_assignment`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_assignment_id: r5AssignmentId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Teste de bloqueio imediato após revogação L3',
+    },
+  });
+  assert.equal(revokeR5.status, 200, `Erro revogando assignment R5: ${sanitizeHttpSummary(revokeR5)}`);
+
+  const r5DownloadAfterRevoke = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerR5.token}`,
+      },
+    },
+  );
+  assert.equal(
+    r5DownloadAfterRevoke.ok,
+    false,
+    `Revisor R5 após revogação deve ser bloqueado imediatamente (${r5DownloadAfterRevoke.status})`,
+  );
+
+  const r5DownloadDirectAfterRevoke = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerR5.token}`,
+      },
+    },
+  );
+  assert.equal(
+    r5DownloadDirectAfterRevoke.ok,
+    false,
+    `Revisor R5 após revogação não pode baixar nem por /object/ (${r5DownloadDirectAfterRevoke.status})`,
+  );
+
+  // 7) Concorrência HTTP real em requisito de F (Promise.all): apenas 1 sucesso, 1 conflito, órfão limpo
+  const concPdf1 = buildValidMinimalPdfBytes(`Concorrente 1 ${runId}`);
+  const concPdf2 = buildValidMinimalPdfBytes(`Concorrente 2 ${runId}`);
+  const [concSubmit1, concSubmit2] = await Promise.all([
+    httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentF.token,
+      processRequirementId: reqFReq.id,
+      idempotencyKey: crypto.randomUUID(),
+      fileBytes: concPdf1,
+      filename: 'conc1.pdf',
+    }),
+    httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentF.token,
+      processRequirementId: reqFReq.id,
+      idempotencyKey: crypto.randomUUID(),
+      fileBytes: concPdf2,
+      filename: 'conc2.pdf',
+    }),
+  ]);
+
+  const concResponses = [concSubmit1, concSubmit2];
+  const concWins = concResponses.filter((r) => r.status === 201);
+  const concLosses = concResponses.filter((r) => r.status === 409);
+  assert.equal(
+    concWins.length,
+    1,
+    `Concorrência devia gerar exatamente 1 submissão 201 (${concResponses.map((r) => `${r.status}:${r.data?.error?.code}`).join(' | ')})`,
+  );
+  assert.equal(
+    concLosses.length,
+    1,
+    `Concorrência devia rejeitar exatamente 1 tentativa com 409 (${concResponses.map((r) => `${r.status}:${r.data?.error?.code}`).join(' | ')})`,
+  );
+
+  const reqFSubs = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqFReq.id}&order=version.desc`,
+    { headers: clientHeaders(studentF.token) },
+  );
+  assert.equal(reqFSubs.data.length, 1);
+  assert.equal(reqFSubs.data[0].version, 1);
+
+  const reqFIntents = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submission_intents?process_requirement_id=eq.${reqFReq.id}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(reqFIntents.status, 200);
+  assert.equal(
+    reqFIntents.data.some((i) => i.status === 'uploading' || i.status === 'orphan_cleanup_pending'),
+    false,
+    'Nenhuma intenção concorrente deve permanecer pendente ou órfã sem compensação',
+  );
+
+  const listReqFObjects = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      prefix: `processes/${procFId}/requirements/${reqFReq.id}/submissions/`,
+      limit: 20,
+      offset: 0,
+    },
+  });
+  assert.equal(listReqFObjects.status, 200);
+  assert.equal(
+    listReqFObjects.data.length,
+    1,
+    `Storage do requisito concorrente deve manter apenas o único objeto vencedor (encontrados ${listReqFObjects.data.length})`,
+  );
+
+  // 8) Compensação segura de objeto órfão após falha pós-upload sem tocar submissões persistidas
+  const orphanPdfBytes = buildValidMinimalPdfBytes(`Orfao Simulado ${runId}`);
+  const orphanSha = crypto.createHash('sha256').update(orphanPdfBytes).digest('hex');
+  const prepOrphan = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_document_submission`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_actor_id: studentE.id,
+      p_process_requirement_id: reqEOpt.id,
+      p_idempotency_key: crypto.randomUUID(),
+      p_original_filename: 'orfao_pos_upload.pdf',
+      p_size_bytes: orphanPdfBytes.byteLength,
+      p_sha256_checksum: orphanSha,
+      p_max_size_bytes: 5242880,
+    },
+  });
+  assert.equal(prepOrphan.status, 200, `Erro preparando intent órfão: ${sanitizeHttpSummary(prepOrphan)}`);
+  const orphanIntentId = prepOrphan.data.intent_id;
+  const orphanPath = prepOrphan.data.storage_path;
+  const encodedOrphanPath = encodeStoragePathSegments(orphanPath);
+
+  const orphanUpload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodedOrphanPath}`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: env.serviceRoleKey,
+        Authorization: `Bearer ${env.serviceRoleKey}`,
+        'Content-Type': 'application/pdf',
+        'x-upsert': 'false',
+      },
+      body: orphanPdfBytes,
+    },
+  );
+  assert.equal(orphanUpload.status, 200, `Upload do órfão ao Storage falhou: HTTP ${orphanUpload.status}`);
+
+  // Simular cancelamento do processo F/requisito ou alterar status para causar falha no finalize_document_submission
+  const orphanCleanupPrep = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_submission_orphan_cleanup`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_intent_id: orphanIntentId,
+      p_error_code: 'simulated_commit_failure',
+      p_error_detail: 'Simulação de erro após upload no Storage',
+    },
+  });
+  assert.equal(orphanCleanupPrep.status, 200);
+  assert.equal(orphanCleanupPrep.data.safe_to_delete, true);
+
+  const deleteOrphan = await httpJson(`${env.apiUrl}/storage/v1/object/internship-documents`, {
+    method: 'DELETE',
+    headers: serviceHeaders,
+    body: { prefixes: [orphanPath] },
+  });
+  assert.equal(deleteOrphan.status, 200, `Exclusão de objeto órfão falhou: ${sanitizeHttpSummary(deleteOrphan)}`);
+
+  const finishOrphanComp = await httpJson(`${env.apiUrl}/rest/v1/rpc/compensate_document_submission_intent`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_intent_id: orphanIntentId,
+      p_outcome_status: 'orphan_cleaned',
+      p_error_code: 'simulated_commit_failure',
+      p_error_detail: 'Objeto órfão removido com segurança',
+    },
+  });
+  assert.equal(finishOrphanComp.status, 200);
+  assert.equal(finishOrphanComp.data.status, 'orphan_cleaned');
+
+  const verifyOrphanGone = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedOrphanPath}`,
+    {
+      headers: {
+        apikey: env.serviceRoleKey,
+        Authorization: `Bearer ${env.serviceRoleKey}`,
+      },
+    },
+  );
+  assert.equal(verifyOrphanGone.ok, false, 'Objeto órfão compensado não deve mais existir no Storage');
+
+  // Confirmar que submissão v1 de reqEReq continua intacta no Storage e banco
+  const checkV1StillIntact = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+      },
+    },
+  );
+  assert.equal(checkV1StillIntact.status, 200);
+  assert.equal(Buffer.compare(checkV1StillIntact.buffer, pdfV1Bytes), 0);
+
+  // 9) ESP-15: Reenvio após correction_requested gera v2 preservando v1 e ordem version DESC
+  const revForCorrection = await httpJson(`${env.apiUrl}/rest/v1/document_reviews`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      process_id: procEId,
+      process_requirement_id: reqEReq.id,
+      submission_id: subV1.id,
+      reviewer_id: reviewerR5.id,
+      decision: 'correction_requested',
+      reason: 'Documento ilegivel na segunda página (fixture HTTP L3).',
+    },
+  });
+  assert.equal(revForCorrection.status, 201, `Erro criando fixture document_reviews: ${sanitizeHttpSummary(revForCorrection)}`);
+
+  const patchSubCorr = await httpJson(`${env.apiUrl}/rest/v1/document_submissions?id=eq.${subV1.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'correction_requested' },
+  });
+  assert.equal(patchSubCorr.ok, true);
+
+  const patchReqCorr = await httpJson(`${env.apiUrl}/rest/v1/process_requirements?id=eq.${reqEReq.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'correction_requested' },
+  });
+  assert.equal(patchReqCorr.ok, true);
+
+  const pdfV2Bytes = buildValidMinimalPdfBytes(`TCE Corrigido Versao 2 ${runId}`);
+  const submitV2 = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfV2Bytes,
+    filename: 'termo_v2_corrigido.pdf',
+  });
+  assert.equal(submitV2.status, 201, `Reenvio v2 falhou: HTTP ${submitV2.status} ${submitV2.text}`);
+  const subV2 = submitV2.data.submission;
+  assert.equal(subV2.version, 2);
+  assert.equal(subV2.status, 'under_review');
+  assert.notEqual(subV2.storage_path, subV1.storage_path);
+  assert.equal(submitV2.data.requirement.current_version, 2);
+  assert.equal(submitV2.data.requirement.current_submission_id, subV2.id);
+
+  // Histórico ordenado do mais recente para o mais antigo e download independente das duas versões
+  const historyRes = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqEReq.id}&order=version.desc`,
+    { headers: clientHeaders(studentE.token) },
+  );
+  assert.equal(historyRes.status, 200);
+  assert.equal(historyRes.data.length, 2);
+  assert.deepEqual(
+    historyRes.data.map((row) => [row.version, row.status]),
+    [
+      [2, 'under_review'],
+      [1, 'correction_requested'],
+    ],
+  );
+
+  const downloadV1AfterV2 = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(subV1.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+      },
+    },
+  );
+  const downloadV2AfterV2 = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(subV2.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentE.token}`,
+      },
+    },
+  );
+  assert.equal(Buffer.compare(downloadV1AfterV2.buffer, pdfV1Bytes), 0, 'Histórico v1 deve permanecer intacto após envio v2');
+  assert.equal(Buffer.compare(downloadV2AfterV2.buffer, pdfV2Bytes), 0, 'Arquivo v2 deve estar acessível com bytes exatos');
+
+  // 10) Requisito aprovado bloqueia novo envio e sessão após logout é rejeitada pela Edge Function
+  const revApprove = await httpJson(`${env.apiUrl}/rest/v1/document_reviews`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      process_id: procEId,
+      process_requirement_id: reqEReq.id,
+      submission_id: subV2.id,
+      reviewer_id: reviewerR5.id,
+      decision: 'approved',
+      reason: null,
+    },
+  });
+  assert.equal(revApprove.status, 201);
+
+  const patchSubApp = await httpJson(`${env.apiUrl}/rest/v1/document_submissions?id=eq.${subV2.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'approved' },
+  });
+  assert.equal(patchSubApp.ok, true);
+
+  const patchReqApp = await httpJson(`${env.apiUrl}/rest/v1/process_requirements?id=eq.${reqEReq.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'approved' },
+  });
+  assert.equal(patchReqApp.ok, true);
+
+  const submitAfterApproved = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEReq.id,
+    fileBytes: buildValidMinimalPdfBytes('Pos Aprovacao'),
+    filename: 'pos_aprovacao.pdf',
+  });
+  assert.equal(submitAfterApproved.status, 409);
+  assert.equal(submitAfterApproved.data?.error?.code, 'requirement_status_conflict');
+
+  const logoutE = await httpJson(`${env.apiUrl}/auth/v1/logout?scope=global`, {
+    method: 'POST',
+    headers: clientHeaders(studentE.token),
+  });
+  assert.equal(logoutE.status, 204);
+
+  const submitAfterLogout = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    processRequirementId: reqEOpt.id,
+    fileBytes: buildValidMinimalPdfBytes('Pos Logout'),
+    filename: 'pos_logout.pdf',
+  });
+  assert.equal(submitAfterLogout.status, 401, `Sessão revogada após logout deve ser rejeitada pela Edge Function (${submitAfterLogout.status})`);
+
+  // 11) Regressões Gate C3: PDF 1.5+ Cross-Reference Stream (C3-03) e recuperação/concorrência de 'uploading' (C3-02)
+  // 11a) PDF 1.5+ legítimo com Cross-Reference Stream (/Type /XRef) aceito com 201 e bytes preservados
+  const xrefStreamPdf = buildValidXrefStreamPdfBytes(`XRef Stream Valido ${runId}`);
+  const xrefSubmitRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentF.token,
+    processRequirementId: reqFOpt.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: xrefStreamPdf,
+    filename: 'documento_pdf15_xref_stream.pdf',
+  });
+  assert.equal(
+    xrefSubmitRes.status,
+    201,
+    `PDF 1.5+ válido com /Type /XRef stream devia retornar 201 (recebido ${xrefSubmitRes.status}: ${xrefSubmitRes.text})`,
+  );
+  const xrefDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(xrefSubmitRes.data.submission.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentF.token}`,
+      },
+    },
+  );
+  assert.equal(xrefDownload.status, 200);
+  assert.equal(Buffer.compare(xrefDownload.buffer, xrefStreamPdf), 0);
+
+  // Provisionar estudante isolado de recuperação para cenários determinísticos C3-02
+  const studentRecovery = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `estudante.rec.c3.${runId}@demo.local`,
+      password: `DemoRec!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Estudante Recuperacao C3',
+    },
+  );
+  const openRecA = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentRecovery.token),
+    body: { p_course_modality_id: catA.modalityId },
+  });
+  assert.equal(openRecA.status, 200);
+  const recAReqsRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${openRecA.data.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentRecovery.token) },
+  );
+  assert.equal(recAReqsRes.data.length, 2);
+  const reqRecLostPrep = recAReqsRes.data[0];
+  const reqRecPostUpload = recAReqsRes.data[1];
+
+  const openRecOther = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentRecovery.token),
+    body: { p_course_modality_id: catOther.modalityId },
+  });
+  assert.equal(openRecOther.status, 200);
+  const recOtherReqsRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${openRecOther.data.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentRecovery.token) },
+  );
+  const reqRecActiveRelease = recOtherReqsRes.data[0];
+
+  const openFOther = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentF.token),
+    body: { p_course_modality_id: catOther.modalityId },
+  });
+  assert.equal(openFOther.status, 200);
+  const fOtherReqsRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${openFOther.data.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentF.token) },
+  );
+  const reqFConcurrentRec = fOtherReqsRes.data[0];
+
+  // 11b) C3-02: Perda de resposta após preparação (intent 'uploading' expirado sem objeto no Storage) -> retry recupera 201
+  const lostPrepPdf = buildValidMinimalPdfBytes(`Recuperacao Lost Prep ${runId}`);
+  const lostPrepSha = crypto.createHash('sha256').update(lostPrepPdf).digest('hex');
+  const lostPrepKey = crypto.randomUUID();
+  const prepLost = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_document_submission`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_actor_id: studentRecovery.id,
+      p_process_requirement_id: reqRecLostPrep.id,
+      p_idempotency_key: lostPrepKey,
+      p_original_filename: 'lost_prep.pdf',
+      p_size_bytes: lostPrepPdf.byteLength,
+      p_sha256_checksum: lostPrepSha,
+      p_max_size_bytes: 5242880,
+      p_lease_ttl_seconds: 0,
+    },
+  });
+  assert.equal(prepLost.status, 200, `Falha preparando fixture lost_prep: ${sanitizeHttpSummary(prepLost)}`);
+
+  const retryLostPrep = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecLostPrep.id,
+    idempotencyKey: lostPrepKey,
+    fileBytes: lostPrepPdf,
+    filename: 'lost_prep.pdf',
+  });
+  assert.equal(
+    retryLostPrep.status,
+    201,
+    `Retry após perda de resposta pós-prepare devia retornar 201 (recebido ${retryLostPrep.status}: ${retryLostPrep.text})`,
+  );
+  assert.equal(retryLostPrep.data.submission.version, 1);
+
+  // 11c) C3-02: Falha de transporte pós-upload no Storage (intent 'uploading' expirado COM objeto íntegro -> ready_to_finalize)
+  const postUploadPdf = buildValidMinimalPdfBytes(`Recuperacao Post Upload ${runId}`);
+  const postUploadSha = crypto.createHash('sha256').update(postUploadPdf).digest('hex');
+  const postUploadKey = crypto.randomUUID();
+  const prepPostUpload = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_document_submission`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_actor_id: studentRecovery.id,
+      p_process_requirement_id: reqRecPostUpload.id,
+      p_idempotency_key: postUploadKey,
+      p_original_filename: 'post_upload_recover.pdf',
+      p_size_bytes: postUploadPdf.byteLength,
+      p_sha256_checksum: postUploadSha,
+      p_max_size_bytes: 5242880,
+      p_lease_ttl_seconds: 0,
+    },
+  });
+  assert.equal(prepPostUpload.status, 200);
+  const interruptedPath = prepPostUpload.data.storage_path;
+  const uploadInterruptedObj = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodeStoragePathSegments(interruptedPath)}`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: env.serviceRoleKey,
+        Authorization: `Bearer ${env.serviceRoleKey}`,
+        'Content-Type': 'application/pdf',
+        'x-upsert': 'false',
+      },
+      body: postUploadPdf,
+    },
+  );
+  assert.equal(uploadInterruptedObj.status, 200);
+
+  const retryPostUpload = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecPostUpload.id,
+    idempotencyKey: postUploadKey,
+    fileBytes: postUploadPdf,
+    filename: 'post_upload_recover.pdf',
+  });
+  assert.equal(
+    retryPostUpload.status,
+    201,
+    `Retomada pós-upload no Storage devia finalizar em 201 sem re-upload (recebido ${retryPostUpload.status}: ${retryPostUpload.text})`,
+  );
+  assert.equal(retryPostUpload.data.submission.storage_path, interruptedPath);
+  assert.equal(retryPostUpload.data.submission.version, 1);
+
+  const replayPostUpload = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecPostUpload.id,
+    idempotencyKey: postUploadKey,
+    fileBytes: postUploadPdf,
+    filename: 'post_upload_recover.pdf',
+  });
+  assert.equal(replayPostUpload.status, 200);
+  assert.equal(replayPostUpload.data.idempotent_replay, true);
+  assert.equal(replayPostUpload.data.submission.id, retryPostUpload.data.submission.id);
+
+  // 11d) C3-02: Diferenciação operação ativa (409) vs liberação por falha de transporte + AbortController
+  const activeLeasePdf = buildValidMinimalPdfBytes(`Active Lease Release ${runId}`);
+  const activeLeaseSha = crypto.createHash('sha256').update(activeLeasePdf).digest('hex');
+  const activeLeaseKey = crypto.randomUUID();
+  const prepActiveLease = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_document_submission`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_actor_id: studentRecovery.id,
+      p_process_requirement_id: reqRecActiveRelease.id,
+      p_idempotency_key: activeLeaseKey,
+      p_original_filename: 'active_lease.pdf',
+      p_size_bytes: activeLeasePdf.byteLength,
+      p_sha256_checksum: activeLeaseSha,
+      p_max_size_bytes: 5242880,
+      p_lease_ttl_seconds: 30,
+    },
+  });
+  assert.equal(prepActiveLease.status, 200);
+
+  const conflictWhileLeaseActive = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecActiveRelease.id,
+    idempotencyKey: activeLeaseKey,
+    fileBytes: activeLeasePdf,
+    filename: 'active_lease.pdf',
+  });
+  assert.equal(conflictWhileLeaseActive.status, 409);
+  assert.equal(conflictWhileLeaseActive.data?.error?.code, 'submission_in_progress');
+
+  // Simular liberação explícita executada pela Edge Function no catch de transporte/abort
+  const releaseActiveAttempt = await httpJson(`${env.apiUrl}/rest/v1/rpc/release_document_submission_attempt`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_intent_id: prepActiveLease.data.intent_id,
+      p_lease_token: prepActiveLease.data.lease_token,
+      p_error_code: 'storage_upload_transport_error',
+      p_error_detail: 'Falha simulada de transporte HTTP',
+    },
+  });
+  assert.equal(releaseActiveAttempt.status, 200);
+  assert.equal(releaseActiveAttempt.data.action, 'aborted_no_object');
+
+  // Disparar AbortController real na Edge Function e recuperar imediatamente na tentativa seguinte
+  const abortController = new AbortController();
+  const abortPromise = httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecActiveRelease.id,
+    idempotencyKey: activeLeaseKey,
+    fileBytes: activeLeasePdf,
+    filename: 'active_lease.pdf',
+    signal: abortController.signal,
+  }).catch((err) => ({ aborted: true, name: err?.name }));
+  abortController.abort();
+  await abortPromise;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const retryAfterAbort = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentRecovery.token,
+    processRequirementId: reqRecActiveRelease.id,
+    idempotencyKey: activeLeaseKey,
+    fileBytes: activeLeasePdf,
+    filename: 'active_lease.pdf',
+  });
+  assert.ok(
+    retryAfterAbort.status === 201 || retryAfterAbort.status === 200,
+    `Retry após falha de transporte/abort não pode ficar preso em 409 (recebido ${retryAfterAbort.status}: ${retryAfterAbort.text})`,
+  );
+  assert.equal(retryAfterAbort.data.submission.version, 1);
+
+  // 11e) C3-02: Retry concorrente (Promise.all) em intenção interrompida não gera duas versões nem dois objetos
+  const concRecPdf = buildValidMinimalPdfBytes(`Retry Concorrente C3 ${runId}`);
+  const concRecSha = crypto.createHash('sha256').update(concRecPdf).digest('hex');
+  const concRecKey = crypto.randomUUID();
+  const prepConcRec = await httpJson(`${env.apiUrl}/rest/v1/rpc/prepare_document_submission`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_actor_id: studentF.id,
+      p_process_requirement_id: reqFConcurrentRec.id,
+      p_idempotency_key: concRecKey,
+      p_original_filename: 'conc_recovery.pdf',
+      p_size_bytes: concRecPdf.byteLength,
+      p_sha256_checksum: concRecSha,
+      p_max_size_bytes: 5242880,
+      p_lease_ttl_seconds: 0,
+    },
+  });
+  assert.equal(prepConcRec.status, 200);
+  const concRecStorageUpload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodeStoragePathSegments(prepConcRec.data.storage_path)}`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: env.serviceRoleKey,
+        Authorization: `Bearer ${env.serviceRoleKey}`,
+        'Content-Type': 'application/pdf',
+        'x-upsert': 'false',
+      },
+      body: concRecPdf,
+    },
+  );
+  assert.equal(concRecStorageUpload.status, 200);
+
+  const [concRecA, concRecB] = await Promise.all([
+    httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentF.token,
+      processRequirementId: reqFConcurrentRec.id,
+      idempotencyKey: concRecKey,
+      fileBytes: concRecPdf,
+      filename: 'conc_recovery.pdf',
+    }),
+    httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentF.token,
+      processRequirementId: reqFConcurrentRec.id,
+      idempotencyKey: concRecKey,
+      fileBytes: concRecPdf,
+      filename: 'conc_recovery.pdf',
+    }),
+  ]);
+  const concRecPair = [concRecA, concRecB];
+  const concRecCreated = concRecPair.filter((r) => r.status === 201);
+  assert.equal(
+    concRecCreated.length,
+    1,
+    `Retomada concorrente devia criar exatamente 1 v1 (201), obtido: ${concRecPair.map((r) => `${r.status}:${r.data?.error?.code}`).join(' | ')}`,
+  );
+  const concRecOther = concRecPair.find((r) => r.status !== 201);
+  assert.ok(
+    concRecOther.status === 200 || concRecOther.status === 409,
+    `Segundo retry concorrente devia receber replay 200 ou conflito de lease ativo 409 (obtido ${concRecOther.status}: ${concRecOther.text})`,
+  );
+
+  const concRecSubs = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqFConcurrentRec.id}`,
+    { headers: clientHeaders(studentF.token) },
+  );
+  assert.equal(concRecSubs.data.length, 1);
+  assert.equal(concRecSubs.data[0].version, 1);
+
+  const concRecObjs = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      prefix: `processes/${openFOther.data.id}/requirements/${reqFConcurrentRec.id}/submissions/`,
+      limit: 20,
+      offset: 0,
+    },
+  });
+  assert.equal(concRecObjs.data.length, 1);
+
+  // 12) Regressões Gate B3-R2 (C3-03 — R1 a R6 em fixtures completamente isoladas)
+  const studentC303 = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `estudante.c303.${runId}@demo.local`,
+      password: `DemoC303!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Estudante Gate B3 R2 C303',
+    },
+  );
+  const studentC303Flate = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `estudante.c303.flate.${runId}@demo.local`,
+      password: `DemoFlate!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Estudante Gate B3 R2 Flate',
+    },
+  );
+
+  const openC303A = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC303.token),
+    body: { p_course_modality_id: catA.modalityId },
+  });
+  assert.equal(openC303A.status, 200);
+  const procC303AId = openC303A.data.id;
+  const reqsC303ARes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procC303AId}&order=display_order.asc`,
+    { headers: clientHeaders(studentC303.token) },
+  );
+  assert.equal(reqsC303ARes.data.length, 2);
+  const reqC303Neg = reqsC303ARes.data[0];
+  const reqC303Classic = reqsC303ARes.data[1];
+
+  const openC303B = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC303.token),
+    body: { p_course_modality_id: catOther.modalityId },
+  });
+  assert.equal(openC303B.status, 200);
+  const procC303BId = openC303B.data.id;
+  const reqsC303BRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procC303BId}&order=display_order.asc`,
+    { headers: clientHeaders(studentC303.token) },
+  );
+  const reqC303Xref = reqsC303BRes.data[0];
+
+  const openC303Flate = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentC303Flate.token),
+    body: { p_course_modality_id: catOther.modalityId },
+  });
+  assert.equal(openC303Flate.status, 200);
+  const reqsC303FlateRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${openC303Flate.data.id}&order=display_order.asc`,
+    { headers: clientHeaders(studentC303Flate.token) },
+  );
+  const reqC303Flate = reqsC303FlateRes.data[0];
+
+  // Confirmar isolamento absoluto antes de R1, R2 e R3
+  const negInitialObjects = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      prefix: `processes/${procC303AId}/requirements/${reqC303Neg.id}/submissions/`,
+      limit: 20,
+      offset: 0,
+    },
+  });
+  assert.equal(negInitialObjects.status, 200);
+  assert.equal(negInitialObjects.data.length, 0);
+
+  // R1 — Dicionário /Type /XRef, /Length 28, sem stream correspondente -> HTTP 422
+  const r1Attempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    processRequirementId: reqC303Neg.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildC303R1MissingStreamXrefPdfBytes(),
+    filename: `r1_sem_stream_${runId}.pdf`,
+  });
+  assert.equal(r1Attempt.status, 422, `R1 devia retornar 422 (obtido ${r1Attempt.status}: ${r1Attempt.text})`);
+  assert.equal(r1Attempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+
+  // R2 — Stream incompleto (menos bytes do que /Length 28 declarado) -> HTTP 422
+  for (const [label, bytes] of [
+    ['curto_direto', buildC303R2IncompleteStreamXrefPdfBytes({ withTrailingPadding: false })],
+    ['curto_com_padding', buildC303R2IncompleteStreamXrefPdfBytes({ withTrailingPadding: true })],
+  ]) {
+    const r2Attempt = await httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentC303.token,
+      processRequirementId: reqC303Neg.id,
+      idempotencyKey: crypto.randomUUID(),
+      fileBytes: bytes,
+      filename: `r2_incompleto_${label}_${runId}.pdf`,
+    });
+    assert.equal(
+      r2Attempt.status,
+      422,
+      `R2 (${label}) devia retornar 422 (obtido ${r2Attempt.status}: ${r2Attempt.text})`,
+    );
+    assert.equal(r2Attempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+  }
+
+  // R3 — Delimitador endstream ausente/desalinhado + /Length indireto não verificável -> HTTP 422
+  for (const [label, bytes] of [
+    ['sem_endstream', buildC303R3MissingEndstreamXrefPdfBytes({ lateEndstream: false })],
+    ['endstream_desalinhado', buildC303R3MissingEndstreamXrefPdfBytes({ lateEndstream: true })],
+    ['length_indireto', buildC303IndirectLengthXrefPdfBytes()],
+  ]) {
+    const r3Attempt = await httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentC303.token,
+      processRequirementId: reqC303Neg.id,
+      idempotencyKey: crypto.randomUUID(),
+      fileBytes: bytes,
+      filename: `r3_${label}_${runId}.pdf`,
+    });
+    assert.equal(
+      r3Attempt.status,
+      422,
+      `R3 (${label}) devia retornar 422 (obtido ${r3Attempt.status}: ${r3Attempt.text})`,
+    );
+    assert.equal(r3Attempt.data?.error?.code, 'truncated_or_corrupted_pdf');
+  }
+
+  // Verificar ausência total de submissões, intents e objetos novos no Storage após R1/R2/R3
+  const negAfterSubs = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqC303Neg.id}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(negAfterSubs.status, 200);
+  assert.equal(negAfterSubs.data.length, 0, 'R1/R2/R3 não podem gerar nenhuma submissão no banco');
+
+  const negAfterIntents = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submission_intents?process_requirement_id=eq.${reqC303Neg.id}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(negAfterIntents.status, 200);
+  assert.equal(negAfterIntents.data.length, 0, 'R1/R2/R3 devem rejeitar antes mesmo de abrir intent no banco');
+
+  const negAfterObjects = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      prefix: `processes/${procC303AId}/requirements/${reqC303Neg.id}/submissions/`,
+      limit: 20,
+      offset: 0,
+    },
+  });
+  assert.equal(negAfterObjects.status, 200);
+  assert.equal(negAfterObjects.data.length, 0, 'R1/R2/R3 não podem gravar nenhum objeto no Storage');
+
+  // R4 — PDF clássico válido -> HTTP 201 + download autorizado 200
+  const r4Pdf = buildValidMinimalPdfBytes(`R4 Classico Valido ${runId}`);
+  const r4IdemKey = crypto.randomUUID();
+  const r4Attempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    processRequirementId: reqC303Classic.id,
+    idempotencyKey: r4IdemKey,
+    fileBytes: r4Pdf,
+    filename: `r4_classico_${runId}.pdf`,
+  });
+  assert.equal(r4Attempt.status, 201, `R4 devia retornar 201 (obtido ${r4Attempt.status}: ${r4Attempt.text})`);
+  assert.equal(r4Attempt.data.idempotent_replay, false);
+  const r4Download = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r4Attempt.data.submission.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentC303.token}`,
+      },
+    },
+  );
+  assert.equal(r4Download.status, 200);
+  assert.equal(Buffer.compare(r4Download.buffer, r4Pdf), 0);
+
+  // R6 — Regressão de idempotência: replay com mesma chave retorna HTTP 200 sem criar v2 ou segundo objeto
+  const r6Replay = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    processRequirementId: reqC303Classic.id,
+    idempotencyKey: r4IdemKey,
+    fileBytes: r4Pdf,
+    filename: `r4_classico_${runId}.pdf`,
+  });
+  assert.equal(r6Replay.status, 200, `R6 devia retornar 200 (obtido ${r6Replay.status}: ${r6Replay.text})`);
+  assert.equal(r6Replay.data.idempotent_replay, true);
+  assert.equal(r6Replay.data.submission.id, r4Attempt.data.submission.id);
+  assert.equal(r6Replay.data.submission.version, 1);
+
+  const r6Subs = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?process_requirement_id=eq.${reqC303Classic.id}`,
+    { headers: clientHeaders(studentC303.token) },
+  );
+  assert.equal(r6Subs.data.length, 1);
+  const r6Objects = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      prefix: `processes/${procC303AId}/requirements/${reqC303Classic.id}/submissions/`,
+      limit: 20,
+      offset: 0,
+    },
+  });
+  assert.equal(r6Objects.data.length, 1);
+
+  // R5 — PDF 1.5+ válido com Cross-Reference Stream (binário bruto e comprimido FlateDecode) -> HTTP 201 + download exato
+  const r5RawPdf = buildValidXrefStreamPdfBytes(`R5 Binario Valido ${runId}`);
+  const r5RawAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    processRequirementId: reqC303Xref.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: r5RawPdf,
+    filename: `r5_xref_raw_${runId}.pdf`,
+  });
+  assert.equal(r5RawAttempt.status, 201, `R5 (raw) devia retornar 201 (obtido ${r5RawAttempt.status}: ${r5RawAttempt.text})`);
+  const r5RawDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r5RawAttempt.data.submission.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentC303.token}`,
+      },
+    },
+  );
+  assert.equal(r5RawDownload.status, 200);
+  assert.equal(Buffer.compare(r5RawDownload.buffer, r5RawPdf), 0);
+
+  const r5FlatePdf = buildValidFlateXrefStreamPdfBytes(`R5 FlateDecode Compacto ${runId}`);
+  const r5FlateAttempt = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303Flate.token,
+    processRequirementId: reqC303Flate.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: r5FlatePdf,
+    filename: `r5_xref_flate_${runId}.pdf`,
+  });
+  assert.equal(
+    r5FlateAttempt.status,
+    201,
+    `R5 (FlateDecode) devia retornar 201 (obtido ${r5FlateAttempt.status}: ${r5FlateAttempt.text})`,
+  );
+  const r5FlateDownload = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r5FlateAttempt.data.submission.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${studentC303Flate.token}`,
+      },
+    },
+  );
+  assert.equal(r5FlateDownload.status, 200);
+  assert.equal(Buffer.compare(r5FlateDownload.buffer, r5FlatePdf), 0);
+
+  console.log('✓ Gate B3-R2 (C3-03 — R1 a R6): XRef stream sem stream/incompleto/sem endstream rejeitados com 422 sem artefatos; clássico, XRef binário/FlateDecode 201 e replay 200 validados');
+  console.log('✓ Lote 3 (ESP-13/14/15 + Gate C3-R1): Storage privado, bloqueio de signed URL para authenticated, recuperação de uploading, startxref estrito e versões v1/v2 validados');
 }
 
 function apiUrlOr(url) {
