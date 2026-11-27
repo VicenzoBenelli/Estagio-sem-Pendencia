@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/responsive/app_breakpoints.dart';
 import '../../processes/application/document_submission_controller.dart';
 import '../../processes/application/process_controller.dart';
 import '../../processes/data/file_picker_pdf_gateway.dart';
 import '../../processes/domain/document_repository.dart';
 import '../../processes/domain/process_repository.dart';
 import '../../processes/presentation/student_processes_workspace.dart';
+import '../../review/application/process_timeline_controller.dart';
+import '../../review/application/reviewer_controller.dart';
+import '../../review/data/pdf_document_renderer.dart';
+import '../../review/domain/review_repository.dart';
+import '../../review/presentation/reviewer_workspace.dart';
 import '../application/auth_controller.dart';
 import '../domain/user_profile.dart';
 
@@ -17,6 +21,7 @@ class StudentHomePage extends StatefulWidget {
     this.processRepository,
     this.documentRepository,
     this.pdfPickerGateway,
+    this.reviewRepository,
     super.key,
   });
 
@@ -25,6 +30,7 @@ class StudentHomePage extends StatefulWidget {
   final ProcessRepository? processRepository;
   final DocumentRepository? documentRepository;
   final PdfPickerGateway? pdfPickerGateway;
+  final ReviewRepository? reviewRepository;
 
   @override
   State<StudentHomePage> createState() => _StudentHomePageState();
@@ -33,6 +39,7 @@ class StudentHomePage extends StatefulWidget {
 class _StudentHomePageState extends State<StudentHomePage> {
   late ProcessController _processController;
   DocumentSubmissionController? _documentController;
+  ProcessTimelineController? _timelineController;
 
   @override
   void initState() {
@@ -44,14 +51,23 @@ class _StudentHomePageState extends State<StudentHomePage> {
     _processController = ProcessController(
       repository: widget.processRepository,
     );
+    _timelineController = widget.reviewRepository == null
+        ? null
+        : ProcessTimelineController(repository: widget.reviewRepository);
     _documentController = widget.documentRepository == null
         ? null
         : DocumentSubmissionController(
             repository: widget.documentRepository,
             pickerGateway:
                 widget.pdfPickerGateway ?? const FilePickerPdfGateway(),
-            onSubmissionCommitted:
-                _processController.refreshAfterDocumentUpdate,
+            onSubmissionCommitted: (processId) async {
+              await _processController.refreshAfterDocumentUpdate(processId);
+              final timelineCtrl = _timelineController;
+              if (timelineCtrl != null &&
+                  timelineCtrl.activeProcessId == processId) {
+                await timelineCtrl.refresh();
+              }
+            },
           );
   }
 
@@ -61,7 +77,8 @@ class _StudentHomePageState extends State<StudentHomePage> {
     if (oldWidget.profile.id != widget.profile.id ||
         oldWidget.processRepository != widget.processRepository ||
         oldWidget.documentRepository != widget.documentRepository ||
-        oldWidget.pdfPickerGateway != widget.pdfPickerGateway) {
+        oldWidget.pdfPickerGateway != widget.pdfPickerGateway ||
+        oldWidget.reviewRepository != widget.reviewRepository) {
       _disposeControllers();
       _initControllers();
     }
@@ -71,6 +88,9 @@ class _StudentHomePageState extends State<StudentHomePage> {
     _documentController?.clearPrivateState();
     _documentController?.dispose();
     _documentController = null;
+    _timelineController?.clearPrivateState();
+    _timelineController?.dispose();
+    _timelineController = null;
     _processController.clearPrivateState();
     _processController.dispose();
   }
@@ -101,6 +121,7 @@ class _StudentHomePageState extends State<StudentHomePage> {
                 ? null
                 : () {
                     _documentController?.clearPrivateState();
+                    _timelineController?.clearPrivateState();
                     _processController.clearPrivateState();
                     widget.controller.signOut();
                   },
@@ -114,193 +135,104 @@ class _StudentHomePageState extends State<StudentHomePage> {
           profile: widget.profile,
           controller: _processController,
           documentController: _documentController,
+          timelineController: _timelineController,
         ),
       ),
     );
   }
 }
 
-class ReviewerHomePage extends StatelessWidget {
+class ReviewerHomePage extends StatefulWidget {
   const ReviewerHomePage({
     required this.profile,
     required this.controller,
+    this.reviewRepository,
+    this.pdfPickerGateway,
+    this.pdfRendererGateway,
     super.key,
   });
 
   final UserProfile profile;
   final AuthController controller;
+  final ReviewRepository? reviewRepository;
+  final PdfPickerGateway? pdfPickerGateway;
+  final PdfRendererGateway? pdfRendererGateway;
 
   @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    return _AuthenticatedRoleShell(
-      profile: profile,
-      controller: controller,
-      appBarTitle: 'Estágio sem Pendência — Revisor',
-      badgeLabel: 'Perfil Revisor (Escopo Protegido)',
-      badgeIcon: Icons.fact_check_outlined,
-      badgeBackground: colors.tertiaryContainer,
-      badgeForeground: colors.onTertiaryContainer,
-      scopeTitle: 'Painel inicial do revisor autenticado',
-      scopeDescription: 'Seu papel foi verificado no backend com isolamento por atribuição de escopo (reviewer_assignments). A fila de revisão documental e o histórico de decisões serão habilitados nos próximos lotes.',
-      disclaimer: 'Aprovação documental no MVP não equivale a autorização oficial de estágio.',
-    );
-  }
+  State<ReviewerHomePage> createState() => _ReviewerHomePageState();
 }
 
-class _AuthenticatedRoleShell extends StatelessWidget {
-  const _AuthenticatedRoleShell({
-    required this.profile,
-    required this.controller,
-    required this.appBarTitle,
-    required this.badgeLabel,
-    required this.badgeIcon,
-    required this.badgeBackground,
-    required this.badgeForeground,
-    required this.scopeTitle,
-    required this.scopeDescription,
-    required this.disclaimer,
-  });
+class _ReviewerHomePageState extends State<ReviewerHomePage> {
+  late ReviewerController _reviewerController;
 
-  final UserProfile profile;
-  final AuthController controller;
-  final String appBarTitle;
-  final String badgeLabel;
-  final IconData badgeIcon;
-  final Color badgeBackground;
-  final Color badgeForeground;
-  final String scopeTitle;
-  final String scopeDescription;
-  final String disclaimer;
+  @override
+  void initState() {
+    super.initState();
+    _initController();
+  }
+
+  void _initController() {
+    _reviewerController = ReviewerController(
+      repository: widget.reviewRepository,
+      pickerGateway: widget.pdfPickerGateway ?? const FilePickerPdfGateway(),
+      pdfRendererGateway: widget.pdfRendererGateway,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant ReviewerHomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.profile.id != widget.profile.id ||
+        oldWidget.reviewRepository != widget.reviewRepository ||
+        oldWidget.pdfPickerGateway != widget.pdfPickerGateway ||
+        oldWidget.pdfRendererGateway != widget.pdfRendererGateway) {
+      _disposeController();
+      _initController();
+    }
+  }
+
+  void _disposeController() {
+    _reviewerController.clearPrivateState();
+    _reviewerController.dispose();
+  }
+
+  @override
+  void dispose() {
+    _disposeController();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
-        title: Text(appBarTitle),
+        title: const Text('Estágio sem Pendência — Revisor'),
         actions: [
           IconButton(
             key: const Key('revalidate_session_button'),
             tooltip: 'Revalidar sessão',
-            onPressed: controller.isBusy ? null : controller.revalidateSession,
+            onPressed: widget.controller.isBusy
+                ? null
+                : widget.controller.revalidateSession,
             icon: const Icon(Icons.refresh),
           ),
           TextButton.icon(
             key: const Key('logout_button'),
-            onPressed: controller.isBusy ? null : controller.signOut,
+            onPressed: widget.controller.isBusy
+                ? null
+                : () {
+                    _reviewerController.clearPrivateState();
+                    widget.controller.signOut();
+                  },
             icon: const Icon(Icons.logout),
             label: const Text('Sair'),
           ),
         ],
       ),
       body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final compact = constraints.maxWidth < AppBreakpoints.compact;
-            return Center(
-              child: SingleChildScrollView(
-                padding: EdgeInsets.all(compact ? 20 : 40),
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 760),
-                  child: Card(
-                    child: Padding(
-                      padding: EdgeInsets.all(compact ? 24 : 36),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: badgeBackground,
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 8,
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    badgeIcon,
-                                    size: 20,
-                                    color: badgeForeground,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    badgeLabel,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .labelLarge
-                                        ?.copyWith(color: badgeForeground),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          Text(
-                            profile.displayName,
-                            style: Theme.of(context).textTheme.headlineSmall,
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            profile.email,
-                            style: Theme.of(context).textTheme.bodyMedium
-                                ?.copyWith(color: colors.onSurfaceVariant),
-                          ),
-                          const SizedBox(height: 20),
-                          Text(
-                            scopeTitle,
-                            style: Theme.of(context).textTheme.titleMedium
-                                ?.copyWith(color: colors.primary),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            scopeDescription,
-                            style: Theme.of(context).textTheme.bodyLarge,
-                          ),
-                          const SizedBox(height: 20),
-                          DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: colors.secondaryContainer,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Icon(
-                                    Icons.info_outline,
-                                    color: colors.onSecondaryContainer,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      disclaimer,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium
-                                          ?.copyWith(
-                                            color: colors.onSecondaryContainer,
-                                          ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
+        child: ReviewerWorkspace(
+          profile: widget.profile,
+          controller: _reviewerController,
         ),
       ),
     );

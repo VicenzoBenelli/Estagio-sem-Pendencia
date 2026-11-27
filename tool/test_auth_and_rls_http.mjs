@@ -82,6 +82,7 @@ function getLocalSupabaseEnv() {
   const anonKey = parsed.ANON_KEY;
   const publishableKey = parsed.PUBLISHABLE_KEY;
   const serviceRoleKey = parsed.SERVICE_ROLE_KEY;
+  const jwtSecret = parsed.JWT_SECRET ?? null;
 
   assert.ok(apiUrl && mailpitUrl && anonKey && serviceRoleKey, 'Config local do Supabase incompleta');
   const host = new URL(apiUrl).hostname;
@@ -89,7 +90,7 @@ function getLocalSupabaseEnv() {
     host === '127.0.0.1' || host === 'localhost',
     `Suite HTTP recusada para host não local: ${host}`,
   );
-  return { apiUrl, mailpitUrl, anonKey, publishableKey, serviceRoleKey };
+  return { apiUrl, mailpitUrl, anonKey, publishableKey, serviceRoleKey, jwtSecret };
 }
 
 async function httpJson(url, { method = 'GET', headers = {}, body } = {}) {
@@ -942,6 +943,28 @@ async function main() {
     // LOTE 3 (ESP-13 / ESP-14 / ESP-15): Storage privado, Edge Upload e Versões
     // ========================================================================
     await runLote3StorageAndSubmissionScenarios({
+      env,
+      runId,
+      clientHeaders,
+      serviceHeaders,
+      sensitivePool,
+    });
+
+    // ========================================================================
+    // LOTE 4 (ESP-18 / ESP-20 / ESP-21): Fila do Revisor, Decisão e Auditoria
+    // ========================================================================
+    await runLote4ReviewQueueAndAuditScenarios({
+      env,
+      runId,
+      clientHeaders,
+      serviceHeaders,
+      sensitivePool,
+    });
+
+    // ========================================================================
+    // GATE E3-BE-FIX: Compatibilidade Cloud Storage + metadados autenticados
+    // ========================================================================
+    await runStorageCloudPolicyRegressionScenarios({
       env,
       runId,
       clientHeaders,
@@ -1899,6 +1922,97 @@ async function httpRawBytes(url, { method = 'GET', headers = {}, body } = {}) {
   };
 }
 
+function mintLocalSignedJwt({
+  userId,
+  role = 'authenticated',
+  jwtSecret,
+  expOffsetSeconds = -600,
+  aud = 'authenticated',
+}) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(
+    JSON.stringify({
+      aud,
+      exp: nowSec + expOffsetSeconds,
+      iat: nowSec + expOffsetSeconds - 3600,
+      sub: userId,
+      role,
+      aal: 'aal1',
+      session_id: crypto.randomUUID(),
+    }),
+  ).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', jwtSecret)
+    .update(`${header}.${payload}`)
+    .digest('base64url');
+  return `${header}.${payload}.${sig}`;
+}
+
+async function httpEdgeDownloadPdf({
+  apiUrl,
+  anonKey,
+  token,
+  submissionId,
+  bodyOverride,
+  rawBody,
+  contentType = 'application/json',
+  method = 'POST',
+  headers: extraHeaders = {},
+  signal,
+}) {
+  const headers = {
+    apikey: anonKey,
+    ...extraHeaders,
+  };
+  if (contentType !== null && !headers['Content-Type']) {
+    headers['Content-Type'] = contentType;
+  }
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  let body;
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (rawBody !== undefined) {
+      body = rawBody;
+    } else if (bodyOverride !== undefined) {
+      body = JSON.stringify(bodyOverride);
+    } else if (submissionId !== undefined) {
+      body = JSON.stringify({ submission_id: submissionId });
+    }
+  }
+
+  const response = await fetch(`${apiUrl}/functions/v1/download-submission-pdf`, {
+    method,
+    headers,
+    body,
+    signal,
+  });
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const text = buffer.toString('utf8');
+  let data = null;
+  const respType = (response.headers.get('content-type') ?? '').toLowerCase();
+  if (respType.includes('application/json') || (!respType.includes('application/pdf') && text)) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    headers: response.headers,
+    buffer,
+    data,
+    text,
+  };
+}
+
 function encodeStoragePathSegments(storagePath) {
   return storagePath
     .split('/')
@@ -2364,8 +2478,9 @@ async function runLote3StorageAndSubmissionScenarios({
   );
   assert.equal(anonStorageRead.ok, false, `Anon não pode baixar PDF privado (${anonStorageRead.status})`);
 
-  // Dono E baixa via endpoint padrão do storage_client (/object/<bucket>/<path>) e /object/authenticated/
-  const ownerDownload = await httpRawBytes(
+  // Dono E baixa via gateway server-side /functions/v1/download-submission-pdf,
+  // enquanto leitura direta em /storage/v1/object/* permanece bloqueada (deny-by-default).
+  const ownerDirectBlocked = await httpRawBytes(
     `${env.apiUrl}/storage/v1/object/internship-documents/${encodedV1Path}`,
     {
       headers: {
@@ -2374,10 +2489,9 @@ async function runLote3StorageAndSubmissionScenarios({
       },
     },
   );
-  assert.equal(ownerDownload.status, 200, `Estudante dono E devia baixar v1: HTTP ${ownerDownload.status}`);
-  assert.equal(Buffer.compare(ownerDownload.buffer, pdfV1Bytes), 0, 'Bytes baixados pelo dono devem ser idênticos aos enviados');
+  assert.equal(ownerDirectBlocked.ok, false, `Leitura direta /object/ deve estar bloqueada (${ownerDirectBlocked.status})`);
 
-  const ownerAuthDownload = await httpRawBytes(
+  const ownerAuthDirectBlocked = await httpRawBytes(
     `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
     {
       headers: {
@@ -2386,8 +2500,17 @@ async function runLote3StorageAndSubmissionScenarios({
       },
     },
   );
-  assert.equal(ownerAuthDownload.status, 200, `Estudante dono E devia baixar v1 via /authenticated/: HTTP ${ownerAuthDownload.status}`);
-  assert.equal(Buffer.compare(ownerAuthDownload.buffer, pdfV1Bytes), 0);
+  assert.equal(ownerAuthDirectBlocked.ok, false, `Leitura direta /object/authenticated/ deve estar bloqueada (${ownerAuthDirectBlocked.status})`);
+
+  const ownerDownload = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    submissionId: subV1.id,
+  });
+  assert.equal(ownerDownload.status, 200, `Estudante dono E devia baixar v1 via gateway: HTTP ${ownerDownload.status}`);
+  assert.equal(ownerDownload.headers.get('content-type')?.toLowerCase().includes('application/pdf'), true);
+  assert.equal(Buffer.compare(ownerDownload.buffer, pdfV1Bytes), 0, 'Bytes baixados pelo dono devem ser idênticos aos enviados');
 
   // Regressão C3-01: usuários comuns (inclusive dono e revisor atribuído) NÃO podem gerar URLs assinadas
   const ownerSignRes = await httpJson(
@@ -2420,7 +2543,7 @@ async function runLote3StorageAndSubmissionScenarios({
     `Dono authenticated não pode obter signed URL em lote (recebido ${ownerSignManyRes.status}: ${ownerSignManyRes.text})`,
   );
 
-  // Estudante F mesmo conhecendo storage_path exato é bloqueado no download e no sign
+  // Estudante F mesmo conhecendo storage_path ou submission_id é bloqueado no download e no sign
   const otherStudentDownload = await httpRawBytes(
     `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
     {
@@ -2431,6 +2554,14 @@ async function runLote3StorageAndSubmissionScenarios({
     },
   );
   assert.equal(otherStudentDownload.ok, false, `Estudante F não pode baixar PDF de E (${otherStudentDownload.status})`);
+
+  const otherStudentGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentF.token,
+    submissionId: subV1.id,
+  });
+  assert.equal(otherStudentGateway.status, 404, `Estudante F deve receber 404 seguro no gateway (${otherStudentGateway.status})`);
 
   const otherStudentSign = await httpJson(
     `${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedV1Path}`,
@@ -2473,7 +2604,7 @@ async function runLote3StorageAndSubmissionScenarios({
     `Revisor R5 não pode obter signed URL em lote (recebido ${r5SignManyRes.status}: ${r5SignManyRes.text})`,
   );
 
-  const r5Download = await httpRawBytes(
+  const r5DirectBlocked = await httpRawBytes(
     `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
     {
       headers: {
@@ -2482,19 +2613,24 @@ async function runLote3StorageAndSubmissionScenarios({
       },
     },
   );
-  assert.equal(r5Download.status, 200, `Revisor atribuído R5 devia baixar PDF v1 (${r5Download.status})`);
+  assert.equal(r5DirectBlocked.ok, false, `Revisor R5 deve ser bloqueado no Storage direto (${r5DirectBlocked.status})`);
+
+  const r5Download = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerR5.token,
+    submissionId: subV1.id,
+  });
+  assert.equal(r5Download.status, 200, `Revisor atribuído R5 devia baixar PDF v1 via gateway (${r5Download.status})`);
   assert.equal(Buffer.compare(r5Download.buffer, pdfV1Bytes), 0);
 
-  const r6Download = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${reviewerR6.token}`,
-      },
-    },
-  );
-  assert.equal(r6Download.ok, false, `Revisor sem assignment no escopo R6 não pode baixar PDF v1 (${r6Download.status})`);
+  const r6Download = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerR6.token,
+    submissionId: subV1.id,
+  });
+  assert.equal(r6Download.status, 404, `Revisor sem assignment no escopo R6 deve receber 404 seguro (${r6Download.status})`);
 
   // Revogar assignment de R5 bloqueia novos acessos autenticados e sign imediatamente
   const revokeR5 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_revoke_reviewer_assignment`, {
@@ -2509,6 +2645,18 @@ async function runLote3StorageAndSubmissionScenarios({
   });
   assert.equal(revokeR5.status, 200, `Erro revogando assignment R5: ${sanitizeHttpSummary(revokeR5)}`);
 
+  const r5GatewayAfterRevoke = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerR5.token,
+    submissionId: subV1.id,
+  });
+  assert.equal(
+    r5GatewayAfterRevoke.status,
+    404,
+    `Revisor R5 após revogação deve perder acesso imediato no gateway (${r5GatewayAfterRevoke.status})`,
+  );
+
   const r5DownloadAfterRevoke = await httpRawBytes(
     `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
     {
@@ -2521,7 +2669,7 @@ async function runLote3StorageAndSubmissionScenarios({
   assert.equal(
     r5DownloadAfterRevoke.ok,
     false,
-    `Revisor R5 após revogação deve ser bloqueado imediatamente (${r5DownloadAfterRevoke.status})`,
+    `Revisor R5 após revogação permanece bloqueado no Storage direto (${r5DownloadAfterRevoke.status})`,
   );
 
   const r5DownloadDirectAfterRevoke = await httpRawBytes(
@@ -2691,16 +2839,13 @@ async function runLote3StorageAndSubmissionScenarios({
   );
   assert.equal(verifyOrphanGone.ok, false, 'Objeto órfão compensado não deve mais existir no Storage');
 
-  // Confirmar que submissão v1 de reqEReq continua intacta no Storage e banco
-  const checkV1StillIntact = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedV1Path}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentE.token}`,
-      },
-    },
-  );
+  // Confirmar que submissão v1 de reqEReq continua intacta via gateway server-side
+  const checkV1StillIntact = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    submissionId: subV1.id,
+  });
   assert.equal(checkV1StillIntact.status, 200);
   assert.equal(Buffer.compare(checkV1StillIntact.buffer, pdfV1Bytes), 0);
 
@@ -2766,24 +2911,20 @@ async function runLote3StorageAndSubmissionScenarios({
     ],
   );
 
-  const downloadV1AfterV2 = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(subV1.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentE.token}`,
-      },
-    },
-  );
-  const downloadV2AfterV2 = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(subV2.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentE.token}`,
-      },
-    },
-  );
+  const downloadV1AfterV2 = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    submissionId: subV1.id,
+  });
+  const downloadV2AfterV2 = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    submissionId: subV2.id,
+  });
+  assert.equal(downloadV1AfterV2.status, 200);
+  assert.equal(downloadV2AfterV2.status, 200);
   assert.equal(Buffer.compare(downloadV1AfterV2.buffer, pdfV1Bytes), 0, 'Histórico v1 deve permanecer intacto após envio v2');
   assert.equal(Buffer.compare(downloadV2AfterV2.buffer, pdfV2Bytes), 0, 'Arquivo v2 deve estar acessível com bytes exatos');
 
@@ -2843,6 +2984,14 @@ async function runLote3StorageAndSubmissionScenarios({
   });
   assert.equal(submitAfterLogout.status, 401, `Sessão revogada após logout deve ser rejeitada pela Edge Function (${submitAfterLogout.status})`);
 
+  const downloadAfterLogout = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentE.token,
+    submissionId: subV2.id,
+  });
+  assert.equal(downloadAfterLogout.status, 401, `Sessão revogada após logout deve ser rejeitada no gateway de download (${downloadAfterLogout.status})`);
+
   // 11) Regressões Gate C3: PDF 1.5+ Cross-Reference Stream (C3-03) e recuperação/concorrência de 'uploading' (C3-02)
   // 11a) PDF 1.5+ legítimo com Cross-Reference Stream (/Type /XRef) aceito com 201 e bytes preservados
   const xrefStreamPdf = buildValidXrefStreamPdfBytes(`XRef Stream Valido ${runId}`);
@@ -2860,15 +3009,12 @@ async function runLote3StorageAndSubmissionScenarios({
     201,
     `PDF 1.5+ válido com /Type /XRef stream devia retornar 201 (recebido ${xrefSubmitRes.status}: ${xrefSubmitRes.text})`,
   );
-  const xrefDownload = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(xrefSubmitRes.data.submission.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentF.token}`,
-      },
-    },
-  );
+  const xrefDownload = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentF.token,
+    submissionId: xrefSubmitRes.data.submission.id,
+  });
   assert.equal(xrefDownload.status, 200);
   assert.equal(Buffer.compare(xrefDownload.buffer, xrefStreamPdf), 0);
 
@@ -3364,15 +3510,12 @@ async function runLote3StorageAndSubmissionScenarios({
   });
   assert.equal(r4Attempt.status, 201, `R4 devia retornar 201 (obtido ${r4Attempt.status}: ${r4Attempt.text})`);
   assert.equal(r4Attempt.data.idempotent_replay, false);
-  const r4Download = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r4Attempt.data.submission.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentC303.token}`,
-      },
-    },
-  );
+  const r4Download = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    submissionId: r4Attempt.data.submission.id,
+  });
   assert.equal(r4Download.status, 200);
   assert.equal(Buffer.compare(r4Download.buffer, r4Pdf), 0);
 
@@ -3419,15 +3562,12 @@ async function runLote3StorageAndSubmissionScenarios({
     filename: `r5_xref_raw_${runId}.pdf`,
   });
   assert.equal(r5RawAttempt.status, 201, `R5 (raw) devia retornar 201 (obtido ${r5RawAttempt.status}: ${r5RawAttempt.text})`);
-  const r5RawDownload = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r5RawAttempt.data.submission.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentC303.token}`,
-      },
-    },
-  );
+  const r5RawDownload = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303.token,
+    submissionId: r5RawAttempt.data.submission.id,
+  });
   assert.equal(r5RawDownload.status, 200);
   assert.equal(Buffer.compare(r5RawDownload.buffer, r5RawPdf), 0);
 
@@ -3446,20 +3586,2270 @@ async function runLote3StorageAndSubmissionScenarios({
     201,
     `R5 (FlateDecode) devia retornar 201 (obtido ${r5FlateAttempt.status}: ${r5FlateAttempt.text})`,
   );
-  const r5FlateDownload = await httpRawBytes(
-    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(r5FlateAttempt.data.submission.storage_path)}`,
-    {
-      headers: {
-        apikey: env.anonKey,
-        Authorization: `Bearer ${studentC303Flate.token}`,
-      },
-    },
-  );
+  const r5FlateDownload = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentC303Flate.token,
+    submissionId: r5FlateAttempt.data.submission.id,
+  });
   assert.equal(r5FlateDownload.status, 200);
   assert.equal(Buffer.compare(r5FlateDownload.buffer, r5FlatePdf), 0);
 
   console.log('✓ Gate B3-R2 (C3-03 — R1 a R6): XRef stream sem stream/incompleto/sem endstream rejeitados com 422 sem artefatos; clássico, XRef binário/FlateDecode 201 e replay 200 validados');
   console.log('✓ Lote 3 (ESP-13/14/15 + Gate C3-R1): Storage privado, bloqueio de signed URL para authenticated, recuperação de uploading, startxref estrito e versões v1/v2 validados');
+}
+
+function parseContentRangeTotal(headers) {
+  const raw = headers.get('content-range') ?? '';
+  const match = /\/(\d+|\*)$/.exec(raw.trim());
+  if (!match) return null;
+  if (match[1] === '*') return null;
+  return Number.parseInt(match[1], 10);
+}
+
+async function createIsolatedModalityUnderCourse(
+  apiUrl,
+  serviceHeaders,
+  { institutionId = DEMO_INSTITUTION_ID, courseId, suffix, items = [] },
+) {
+  const modality = await httpJson(`${apiUrl}/rest/v1/course_modalities`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      course_id: courseId,
+      code: `L4_MOD_${suffix}`,
+      name: `Modalidade L4 HTTP (${suffix})`,
+      is_mandatory: false,
+      is_demo: true,
+      active: true,
+    },
+  });
+  assert.equal(modality.status, 201, `Erro criando modalidade L4 (${suffix}): ${sanitizeHttpSummary(modality)}`);
+  const modalityId = modality.data[0].id;
+
+  const tplDraft = await httpJson(`${apiUrl}/rest/v1/requirement_templates`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      institution_id: institutionId,
+      course_id: courseId,
+      course_modality_id: modalityId,
+      version: 1,
+      title: `Template L4 v1 (${suffix})`,
+      source_reference: 'Dados fictícios automatizados Lote 4 HTTP',
+      status: 'draft',
+      is_demo: true,
+    },
+  });
+  assert.equal(tplDraft.status, 201, `Erro criando template L4 (${suffix}): ${sanitizeHttpSummary(tplDraft)}`);
+  const templateId = tplDraft.data[0].id;
+
+  for (const itemSpec of items) {
+    const insertedItem = await httpJson(`${apiUrl}/rest/v1/requirement_template_items`, {
+      method: 'POST',
+      headers: { ...serviceHeaders, Prefer: 'return=representation' },
+      body: {
+        template_id: templateId,
+        code: itemSpec.code,
+        title: itemSpec.title,
+        description: itemSpec.description,
+        acceptance_criteria: itemSpec.acceptanceCriteria,
+        is_required: itemSpec.isRequired,
+        display_order: itemSpec.displayOrder,
+        is_demo: true,
+      },
+    });
+    assert.equal(insertedItem.status, 201, `Erro criando item L4 (${itemSpec.code}): ${sanitizeHttpSummary(insertedItem)}`);
+  }
+
+  const pub = await httpJson(`${apiUrl}/rest/v1/requirement_templates?id=eq.${templateId}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'published' },
+  });
+  assert.equal(pub.ok, true, `Erro publicando template L4 (${suffix}): ${sanitizeHttpSummary(pub)}`);
+
+  return { institutionId, courseId, modalityId, templateId };
+}
+
+async function runLote4ReviewQueueAndAuditScenarios({
+  env,
+  runId,
+  clientHeaders,
+  serviceHeaders,
+  sensitivePool,
+}) {
+  const studentG = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `estudante.g.l4.${runId}@demo.local`,
+      password: `DemoGL4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Estudante G Lote 4 HTTP',
+    },
+  );
+  const studentH = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `estudante.h.l4.${runId}@demo.local`,
+      password: `DemoHL4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Estudante H Lote 4 HTTP',
+    },
+  );
+
+  const reviewerMod = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `revisor.mod.l4.${runId}@demo.local`,
+      password: `DemoRM4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Revisor Modalidade L4',
+    },
+  );
+  const reviewerTwin = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `revisor.twin.l4.${runId}@demo.local`,
+      password: `DemoRT4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Revisor Gemeo L4',
+    },
+  );
+  const reviewerCourse = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `revisor.course.l4.${runId}@demo.local`,
+      password: `DemoRC4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Revisor Curso L4',
+    },
+  );
+  const reviewerOther = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `revisor.other.l4.${runId}@demo.local`,
+      password: `DemoRO4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Revisor Outro Escopo L4',
+    },
+  );
+  const reviewerNone = await createConfirmedAdminUser(
+    env.apiUrl,
+    serviceHeaders,
+    clientHeaders,
+    env.anonKey,
+    sensitivePool,
+    {
+      email: `revisor.none.l4.${runId}@demo.local`,
+      password: `DemoRN4!${crypto.randomBytes(8).toString('hex')}`,
+      fullName: 'Revisor Sem Atribuicao L4',
+    },
+  );
+
+  for (const rev of [reviewerMod, reviewerTwin, reviewerCourse, reviewerOther, reviewerNone]) {
+    const promote = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_set_user_role`, {
+      method: 'POST',
+      headers: serviceHeaders,
+      body: {
+        p_user_id: rev.id,
+        p_new_role: 'reviewer',
+        p_operator_type: OPERATOR_TYPE,
+        p_operator_identifier: OPERATOR_IDENTIFIER,
+        p_reason: 'Provisionamento Lote 4 HTTP',
+      },
+    });
+    assert.equal(promote.status, 200, `Erro promovendo revisor L4: ${sanitizeHttpSummary(promote)}`);
+  }
+
+  // Catálogos isolados do Lote 4
+  const catMain = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `L4_MAIN_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L4_OBR1_${runId}`,
+        title: '[Demo L4] Termo Obrigatorio 1',
+        description: 'Termo de compromisso L4',
+        acceptanceCriteria: 'PDF assinado',
+        isRequired: true,
+        displayOrder: 1,
+      },
+      {
+        code: `L4_OBR2_${runId}`,
+        title: '[Demo L4] Plano Obrigatorio 2',
+        description: 'Plano de atividades L4',
+        acceptanceCriteria: 'PDF completo',
+        isRequired: true,
+        displayOrder: 2,
+      },
+      {
+        code: `L4_OPC1_${runId}`,
+        title: '[Demo L4] Documento Opcional 1',
+        description: 'Opcional 1 L4',
+        acceptanceCriteria: 'PDF legivel',
+        isRequired: false,
+        displayOrder: 3,
+      },
+      {
+        code: `L4_OPC2_${runId}`,
+        title: '[Demo L4] Documento Opcional 2',
+        description: 'Opcional 2 L4',
+        acceptanceCriteria: 'PDF legivel',
+        isRequired: false,
+        displayOrder: 4,
+      },
+    ],
+  });
+
+  const catSecondMod = await createIsolatedModalityUnderCourse(env.apiUrl, serviceHeaders, {
+    institutionId: catMain.institutionId,
+    courseId: catMain.courseId,
+    suffix: `L4_OPTMOD_${runId}`,
+    items: [
+      {
+        code: `L4_ONLY_OPT_${runId}`,
+        title: '[Demo L4] Modalidade Somente Opcional',
+        description: 'Sem obrigatorios',
+        acceptanceCriteria: 'PDF legivel',
+        isRequired: false,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  const catOther = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `L4_OTHER_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `L4_OUT_${runId}`,
+        title: '[Demo L4] Outro Curso Obrigatorio',
+        description: 'Outro escopo',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  // Atribuir escopos distintos
+  const assignModRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerMod.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: catMain.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L4 reviewerMod somente mod1',
+    },
+  });
+  assert.equal(assignModRes.status, 200);
+  const reviewerModAssignmentId = assignModRes.data.id;
+
+  const assignTwinRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerTwin.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: catMain.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L4 reviewerTwin somente mod1',
+    },
+  });
+  assert.equal(assignTwinRes.status, 200);
+
+  const assignCourseRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerCourse.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: null,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L4 reviewerCourse todo curso',
+    },
+  });
+  assert.equal(assignCourseRes.status, 200);
+
+  const assignOtherRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerOther.id,
+      p_institution_id: catOther.institutionId,
+      p_course_id: catOther.courseId,
+      p_course_modality_id: catOther.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Escopo L4 reviewerOther outro curso',
+    },
+  });
+  assert.equal(assignOtherRes.status, 200);
+
+  // Abrir processos para G e H
+  const openG1 = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentG.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(openG1.status, 200);
+  const procG1Id = openG1.data.id;
+
+  const openG2 = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentG.token),
+    body: { p_course_modality_id: catSecondMod.modalityId },
+  });
+  assert.equal(openG2.status, 200);
+  const procG2Id = openG2.data.id;
+
+  const openH1 = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentH.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(openH1.status, 200);
+  const procH1Id = openH1.data.id;
+
+  const openHOther = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentH.token),
+    body: { p_course_modality_id: catOther.modalityId },
+  });
+  assert.equal(openHOther.status, 200);
+  const procHOtherId = openHOther.data.id;
+
+  const g1Reqs = (
+    await httpJson(
+      `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procG1Id}&order=display_order.asc`,
+      { headers: clientHeaders(studentG.token) },
+    )
+  ).data;
+  const g2Reqs = (
+    await httpJson(
+      `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procG2Id}&order=display_order.asc`,
+      { headers: clientHeaders(studentG.token) },
+    )
+  ).data;
+  const h1Reqs = (
+    await httpJson(
+      `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procH1Id}&order=display_order.asc`,
+      { headers: clientHeaders(studentH.token) },
+    )
+  ).data;
+  const hOtherReqs = (
+    await httpJson(
+      `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procHOtherId}&order=display_order.asc`,
+      { headers: clientHeaders(studentH.token) },
+    )
+  ).data;
+
+  const reqGObr1 = g1Reqs[0];
+  const reqGObr2 = g1Reqs[1];
+  const reqGOpc1 = g1Reqs[2];
+  const reqGOpc2 = g1Reqs[3];
+  const reqGOnlyOpt = g2Reqs[0];
+  const reqHCancel = h1Reqs[0];
+  const reqHOther = hOtherReqs[0];
+
+  // Uploads reais via Edge Function submit-requirement-pdf
+  const pdfObr1V1 = buildValidMinimalPdfBytes(`L4 OBR1 V1 ${runId}`);
+  const subObr1V1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGObr1.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfObr1V1,
+    filename: 'termo_l4_v1.pdf',
+  });
+  assert.equal(subObr1V1Res.status, 201, `Upload OBR1 v1 falhou: ${subObr1V1Res.text}`);
+  const subObr1V1 = subObr1V1Res.data.submission;
+
+  const subObr2V1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGObr2.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 OBR2 V1 ${runId}`),
+    filename: 'plano_l4_v1.pdf',
+  });
+  assert.equal(subObr2V1Res.status, 201);
+  const subObr2V1 = subObr2V1Res.data.submission;
+
+  const subOpc1V1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGOpc1.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 OPC1 V1 ${runId}`),
+    filename: 'opcional1_l4_v1.pdf',
+  });
+  assert.equal(subOpc1V1Res.status, 201);
+  const subOpc1V1 = subOpc1V1Res.data.submission;
+
+  const subOnlyOptV1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGOnlyOpt.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 ONLY OPT V1 ${runId}`),
+    filename: 'somente_opcional_v1.pdf',
+  });
+  assert.equal(subOnlyOptV1Res.status, 201);
+  const subOnlyOptV1 = subOnlyOptV1Res.data.submission;
+
+  const subHCancelV1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentH.token,
+    processRequirementId: reqHCancel.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 CANCEL V1 ${runId}`),
+    filename: 'cancelado_v1.pdf',
+  });
+  assert.equal(subHCancelV1Res.status, 201);
+  const subHCancelV1 = subHCancelV1Res.data.submission;
+
+  // Cancelar procH1 após submissão under_review -> deve sumir da fila e bloquear decisão
+  const cancelH1 = await httpJson(`${env.apiUrl}/rest/v1/internship_processes?id=eq.${procH1Id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { status: 'cancelled', closed_at: new Date().toISOString() },
+  });
+  assert.equal(cancelH1.ok, true, `Erro cancelando procH1: ${sanitizeHttpSummary(cancelH1)}`);
+
+  const subHOtherV1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentH.token,
+    processRequirementId: reqHOther.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 OTHER V1 ${runId}`),
+    filename: 'outro_escopo_v1.pdf',
+  });
+  assert.equal(subHOtherV1Res.status, 201);
+  const subHOtherV1 = subHOtherV1Res.data.submission;
+
+  // 1) ESP-18: Anon bloqueado; estudante e revisor sem assignment veem 0 linhas; escopos isolados e processo cancelado excluído
+  const anonQueue = await httpJson(`${env.apiUrl}/rest/v1/reviewer_queue_v`, {
+    headers: { apikey: env.anonKey, Authorization: `Bearer ${env.anonKey}` },
+  });
+  assert.ok(anonQueue.status === 401 || anonQueue.status === 403);
+
+  const studentQueue = await httpJson(`${env.apiUrl}/rest/v1/reviewer_queue_v`, {
+    headers: clientHeaders(studentG.token),
+  });
+  assert.equal(studentQueue.status, 200);
+  assert.equal(studentQueue.data.length, 0, 'Estudante não pode ver nenhum item na fila do revisor');
+
+  const unassignedQueue = await httpJson(`${env.apiUrl}/rest/v1/reviewer_queue_v`, {
+    headers: clientHeaders(reviewerNone.token),
+  });
+  assert.equal(unassignedQueue.status, 200);
+  assert.equal(unassignedQueue.data.length, 0, 'Revisor sem atribuição vê 0 itens na fila');
+
+  const otherQueueInMain = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}`,
+    { headers: clientHeaders(reviewerOther.token) },
+  );
+  assert.equal(otherQueueInMain.status, 200);
+  assert.equal(otherQueueInMain.data.length, 0, 'Revisor de outro curso vê 0 itens de catMain');
+
+  const otherQueueOwn = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catOther.courseId}`,
+    { headers: clientHeaders(reviewerOther.token) },
+  );
+  assert.equal(otherQueueOwn.status, 200);
+  assert.deepEqual(otherQueueOwn.data.map((r) => r.submission_id), [subHOtherV1.id]);
+
+  const modQueue = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&order=submitted_at.asc,submission_id.asc`,
+    { headers: clientHeaders(reviewerMod.token) },
+  );
+  assert.equal(modQueue.status, 200);
+  assert.deepEqual(
+    modQueue.data.map((r) => r.submission_id),
+    [subObr1V1.id, subObr2V1.id, subOpc1V1.id],
+    'Revisor de modalidade vê apenas itens não cancelados de catMain.modalityId',
+  );
+  assert.equal(
+    modQueue.data.some((r) => r.process_id === procH1Id || r.submission_id === subHCancelV1.id),
+    false,
+    'Processo cancelado nunca aparece na fila do revisor',
+  );
+
+  // 2) ESP-18: Paginação determinística + Content-Range + filtros no escopo curso (course_modality_id NULL)
+  const coursePage1 = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&order=submitted_at.asc,submission_id.asc&limit=2&offset=0`,
+    {
+      headers: {
+        ...clientHeaders(reviewerCourse.token),
+        Prefer: 'count=exact',
+      },
+    },
+  );
+  assert.equal(coursePage1.ok, true, `Paginação página 1 da fila falhou: ${sanitizeHttpSummary(coursePage1)}`);
+  assert.equal(parseContentRangeTotal(coursePage1.headers), 4);
+  assert.equal(coursePage1.data.length, 2);
+
+  const coursePage2 = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&order=submitted_at.asc,submission_id.asc&limit=2&offset=2`,
+    {
+      headers: {
+        ...clientHeaders(reviewerCourse.token),
+        Prefer: 'count=exact',
+      },
+    },
+  );
+  assert.equal(coursePage2.ok, true);
+  assert.equal(parseContentRangeTotal(coursePage2.headers), 4);
+  assert.equal(coursePage2.data.length, 2);
+  const paginatedQueueIds = [...coursePage1.data, ...coursePage2.data].map((r) => r.submission_id);
+  assert.deepEqual(
+    paginatedQueueIds,
+    [subObr1V1.id, subObr2V1.id, subOpc1V1.id, subOnlyOptV1.id],
+    'Paginação da fila deve retornar as 2 páginas em ordem exata sem repetição ou omissão',
+  );
+
+  const filterRequired = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&is_required=eq.true&order=submitted_at.asc,submission_id.asc`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(filterRequired.status, 200);
+  assert.deepEqual(filterRequired.data.map((r) => r.submission_id), [subObr1V1.id, subObr2V1.id]);
+
+  const filterMod2 = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&course_modality_id=eq.${catSecondMod.modalityId}`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(filterMod2.status, 200);
+  assert.deepEqual(filterMod2.data.map((r) => r.submission_id), [subOnlyOptV1.id]);
+
+  const filterSearch = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&or=(${encodeURIComponent(`requirement_code.eq.L4_OBR1_${runId},student_name.ilike.*Estudante G Lote 4*`)})&course_modality_id=eq.${catMain.modalityId}&order=submitted_at.asc,submission_id.asc`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(filterSearch.status, 200);
+  assert.deepEqual(filterSearch.data.map((r) => r.submission_id), [subObr1V1.id, subObr2V1.id, subOpc1V1.id]);
+
+  const filterExactCode = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}&requirement_code=eq.L4_OBR1_${runId}&is_resubmission=eq.false`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(filterExactCode.status, 200);
+  assert.deepEqual(filterExactCode.data.map((r) => r.submission_id), [subObr1V1.id]);
+
+  // 3) ESP-19 / ESP-13: Download via gateway pelo revisor e bloqueio direto no Storage / signed URL / fora do escopo
+  const encodedObr1V1Path = encodeStoragePathSegments(subObr1V1.storage_path);
+  const revDirectBlocked = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedObr1V1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerMod.token}`,
+      },
+    },
+  );
+  assert.equal(revDirectBlocked.ok, false, 'Revisor também é bloqueado na leitura direta do Storage');
+
+  const revDownloadOk = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerMod.token,
+    submissionId: subObr1V1.id,
+  });
+  assert.equal(revDownloadOk.status, 200);
+  assert.equal(Buffer.compare(revDownloadOk.buffer, pdfObr1V1), 0);
+
+  const revSignBlocked = await httpJson(
+    `${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedObr1V1Path}`,
+    {
+      method: 'POST',
+      headers: clientHeaders(reviewerMod.token),
+      body: { expiresIn: 60 },
+    },
+  );
+  assert.equal(revSignBlocked.ok, false, 'Revisor não pode gerar URL assinada');
+
+  const otherDownloadBlocked = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedObr1V1Path}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerOther.token}`,
+      },
+    },
+  );
+  assert.equal(otherDownloadBlocked.ok, false, 'Revisor fora do escopo não baixa PDF diretamente');
+
+  const otherGatewayBlocked = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerOther.token,
+    submissionId: subObr1V1.id,
+  });
+  assert.equal(otherGatewayBlocked.status, 404, 'Revisor fora do escopo recebe 404 seguro no gateway');
+
+  // 4) ESP-20: Negativos da RPC review_submission e tentativas diretas em document_reviews / audit_events
+  const anonReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(env.anonKey),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'approved' },
+  });
+  assert.ok(anonReview.status === 401 || anonReview.status === 403);
+
+  const studentReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(studentG.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'approved' },
+  });
+  assert.equal(studentReview.status, 403);
+  assert.equal(studentReview.data?.code, '42501');
+
+  const unassignedReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerNone.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'approved' },
+  });
+  assert.equal(unassignedReview.status, 403);
+  assert.equal(unassignedReview.data?.code, '42501');
+
+  const outOfScopeReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerOther.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'approved' },
+  });
+  assert.equal(outOfScopeReview.status, 403);
+  assert.equal(outOfScopeReview.data?.code, '42501');
+
+  const cancelledReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: { p_submission_id: subHCancelV1.id, p_decision: 'approved' },
+  });
+  assert.equal(cancelledReview.status, 403);
+  assert.equal(cancelledReview.data?.code, '42501');
+
+  const missingSubReview = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: { p_submission_id: crypto.randomUUID(), p_decision: 'approved' },
+  });
+  assert.equal(missingSubReview.status, 500);
+  assert.equal(missingSubReview.data?.code, 'P0002');
+
+  const emptyReasonCorrection = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'correction_requested', p_reason: '  \n\t ' },
+  });
+  assert.equal(emptyReasonCorrection.status, 400);
+  assert.equal(emptyReasonCorrection.data?.code, '22023');
+
+  const tooLongReasonCorrection = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'correction_requested', p_reason: 'x'.repeat(2001) },
+  });
+  assert.equal(tooLongReasonCorrection.status, 400);
+  assert.equal(tooLongReasonCorrection.data?.code, '22023');
+  assert.ok(String(tooLongReasonCorrection.data?.message ?? '').includes('[ERR:reason_too_long]'));
+
+  const invalidDecision = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: { p_submission_id: subObr1V1.id, p_decision: 'published', p_reason: 'x' },
+  });
+  assert.equal(invalidDecision.status, 400);
+  assert.equal(invalidDecision.data?.code, '22023');
+
+  const directInsertReview = await httpJson(`${env.apiUrl}/rest/v1/document_reviews`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      process_id: procG1Id,
+      process_requirement_id: reqGObr1.id,
+      submission_id: subObr1V1.id,
+      reviewer_id: reviewerMod.id,
+      decision: 'approved',
+    },
+  });
+  assert.equal(directInsertReview.ok, false, 'INSERT direto em document_reviews pelo cliente deve falhar');
+
+  // 5) Processo sem itens obrigatórios (procG2): aprovar único opcional mantém status in_progress e progress indeterminate
+  const approveOnlyOpt = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerCourse.token),
+    body: {
+      p_submission_id: subOnlyOptV1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(approveOnlyOpt.status, 200, `Erro aprovando processo opcional: ${sanitizeHttpSummary(approveOnlyOpt)}`);
+  assert.equal(approveOnlyOpt.data.process.status, 'in_progress');
+  assert.equal(approveOnlyOpt.data.progress.progress_status, 'indeterminate');
+  assert.equal(approveOnlyOpt.data.progress.progress_percentage, null);
+
+  // 6) Fluxo completo: correction_requested -> retry idempotente -> bloqueio dupla decisão -> reenvio v2 -> corrida concorrente -> aprovação
+  const idemCorrKey = crypto.randomUUID();
+  const corrReason = 'Falta assinatura do supervisor na página 2.';
+  const corrRes = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'correction_requested',
+      p_reason: `  ${corrReason}  `,
+      p_idempotency_key: idemCorrKey,
+    },
+  });
+  assert.equal(corrRes.status, 200, `Falha em correction_requested: ${sanitizeHttpSummary(corrRes)}`);
+  assert.equal(corrRes.data.ok, true);
+  assert.equal(corrRes.data.idempotent_replay, false);
+  assert.equal(corrRes.data.review.decision, 'correction_requested');
+  assert.equal(corrRes.data.review.reason, corrReason);
+  assert.equal(corrRes.data.requirement.status, 'correction_requested');
+  assert.equal(corrRes.data.submission.status, 'correction_requested');
+
+  // Retry idempotente exato -> 200 replay sem duplicar review/evento
+  const corrRetry = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'correction_requested',
+      p_reason: corrReason,
+      p_idempotency_key: idemCorrKey,
+    },
+  });
+  assert.equal(corrRetry.status, 200);
+  assert.equal(corrRetry.data.idempotent_replay, true);
+  assert.equal(corrRetry.data.review.id, corrRes.data.review.id);
+
+  // Reuso de mesma chave com decisão diferente -> 409
+  const corrMismatch = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: idemCorrKey,
+    },
+  });
+  assert.equal(corrMismatch.status, 409);
+  assert.equal(corrMismatch.data?.code, '23505');
+
+  // Dupla decisão por outro revisor na mesma v1 -> 409
+  const doubleDecisionTwin = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerTwin.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(doubleDecisionTwin.status, 409);
+  assert.equal(doubleDecisionTwin.data?.code, '23505');
+
+  // Estudante G consulta justificativa via document_reviews e item já não aparece na fila
+  const studentReadsReview = await httpJson(
+    `${env.apiUrl}/rest/v1/document_reviews?process_requirement_id=eq.${reqGObr1.id}&order=reviewed_at.desc`,
+    { headers: clientHeaders(studentG.token) },
+  );
+  assert.equal(studentReadsReview.status, 200);
+  assert.equal(studentReadsReview.data.length, 1);
+  assert.equal(studentReadsReview.data[0].reason, corrReason);
+
+  const queueWithoutV1 = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?process_requirement_id=eq.${reqGObr1.id}`,
+    { headers: clientHeaders(reviewerMod.token) },
+  );
+  assert.equal(queueWithoutV1.status, 200);
+  assert.equal(queueWithoutV1.data.length, 0);
+
+  // Estudante G reenvia v2 via Edge Function -> v2 entra na fila como is_resubmission=true e v1 permanece preservada
+  const pdfObr1V2 = buildValidMinimalPdfBytes(`L4 OBR1 V2 CORRIGIDO ${runId}`);
+  const subObr1V2Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGObr1.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfObr1V2,
+    filename: 'termo_l4_v2_corrigido.pdf',
+  });
+  assert.equal(subObr1V2Res.status, 201, `Reenvio v2 falhou: ${subObr1V2Res.text}`);
+  const subObr1V2 = subObr1V2Res.data.submission;
+  assert.equal(subObr1V2.version, 2);
+
+  const queueAfterResubmit = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?process_requirement_id=eq.${reqGObr1.id}&is_resubmission=eq.true`,
+    { headers: clientHeaders(reviewerMod.token) },
+  );
+  assert.equal(queueAfterResubmit.status, 200);
+  assert.equal(queueAfterResubmit.data.length, 1);
+  assert.equal(queueAfterResubmit.data[0].submission_id, subObr1V2.id);
+  assert.equal(queueAfterResubmit.data[0].submission_version, 2);
+  assert.equal(queueAfterResubmit.data[0].is_resubmission, true);
+
+  // Tentativa sobre v1 obsoleta continua bloqueada (409)
+  const obsoleteReviewAttempt = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(obsoleteReviewAttempt.status, 409);
+
+  // Concorrência HTTP real (Promise.all): 2 revisores decidindo subObr1V2 simultaneamente -> 1 vence (200), 1 perde (409)
+  const [raceA, raceB] = await Promise.all([
+    httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+      method: 'POST',
+      headers: clientHeaders(reviewerMod.token),
+      body: {
+        p_submission_id: subObr1V2.id,
+        p_decision: 'approved',
+        p_reason: 'Conferido A',
+        p_idempotency_key: crypto.randomUUID(),
+      },
+    }),
+    httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+      method: 'POST',
+      headers: clientHeaders(reviewerTwin.token),
+      body: {
+        p_submission_id: subObr1V2.id,
+        p_decision: 'correction_requested',
+        p_reason: 'Conflito B',
+        p_idempotency_key: crypto.randomUUID(),
+      },
+    }),
+  ]);
+  const raceResults = [raceA, raceB];
+  const raceWins = raceResults.filter((r) => r.status === 200);
+  const raceConflicts = raceResults.filter((r) => r.status === 409);
+  assert.equal(
+    raceWins.length,
+    1,
+    `Corrida HTTP em review_submission devia aprovar exatamente 1 (${raceResults.map(sanitizeHttpSummary).join(' | ')})`,
+  );
+  assert.equal(
+    raceConflicts.length,
+    1,
+    `Corrida HTTP em review_submission devia rejeitar exatamente 1 com 409 (${raceResults.map(sanitizeHttpSummary).join(' | ')})`,
+  );
+  assert.equal(raceConflicts[0].data?.code, '23505');
+  const winningReviewId = raceWins[0].data.review.id;
+  const winningDecision = raceWins[0].data.review.decision;
+
+  // Garantir que apenas 1 review e 1 audit_event foram gravados para subObr1V2
+  const reviewsForV2 = await httpJson(
+    `${env.apiUrl}/rest/v1/document_reviews?submission_id=eq.${subObr1V2.id}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(reviewsForV2.data.length, 1);
+
+  const auditForV2Review = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?entity_table=eq.document_reviews&entity_id=eq.${winningReviewId}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(auditForV2Review.data.length, 1);
+
+  // Se o vencedor da corrida foi reviewerTwin com correction_requested, reenviar v3 e aprovar determinístico
+  if (winningDecision === 'correction_requested') {
+    const subObr1V3Res = await httpEdgeSubmitPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: studentG.token,
+      processRequirementId: reqGObr1.id,
+      idempotencyKey: crypto.randomUUID(),
+      fileBytes: buildValidMinimalPdfBytes(`L4 OBR1 V3 FINAL ${runId}`),
+      filename: 'termo_l4_v3_final.pdf',
+    });
+    assert.equal(subObr1V3Res.status, 201);
+    const approveV3 = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+      method: 'POST',
+      headers: clientHeaders(reviewerMod.token),
+      body: {
+        p_submission_id: subObr1V3Res.data.submission.id,
+        p_decision: 'approved',
+        p_idempotency_key: crypto.randomUUID(),
+      },
+    });
+    assert.equal(approveV3.status, 200);
+  }
+
+  // Aprovar OBR2 com concorrência idêntica da mesma chave -> ambos retornam 200 (1 replay=false, 1 replay=true), sem duplicidade
+  const obr2IdemKey = crypto.randomUUID();
+  const [obr2ConcurrentA, obr2ConcurrentB] = await Promise.all([
+    httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+      method: 'POST',
+      headers: clientHeaders(reviewerMod.token),
+      body: {
+        p_submission_id: subObr2V1.id,
+        p_decision: 'approved',
+        p_idempotency_key: obr2IdemKey,
+      },
+    }),
+    httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+      method: 'POST',
+      headers: clientHeaders(reviewerMod.token),
+      body: {
+        p_submission_id: subObr2V1.id,
+        p_decision: 'approved',
+        p_idempotency_key: obr2IdemKey,
+      },
+    }),
+  ]);
+  assert.equal(obr2ConcurrentA.status, 200, `Falha concorrência idempotente A OBR2: ${sanitizeHttpSummary(obr2ConcurrentA)}`);
+  assert.equal(obr2ConcurrentB.status, 200, `Falha concorrência idempotente B OBR2: ${sanitizeHttpSummary(obr2ConcurrentB)}`);
+  const replayFlags = [obr2ConcurrentA.data.idempotent_replay, obr2ConcurrentB.data.idempotent_replay].sort();
+  assert.deepEqual(replayFlags, [false, true], 'Concorrência com mesma idempotency_key deve gerar 1 execução e 1 replay');
+  const approveObr2 = obr2ConcurrentA.data.idempotent_replay ? obr2ConcurrentB : obr2ConcurrentA;
+  assert.equal(approveObr2.data.process.status, 'documentally_complete');
+  assert.equal(approveObr2.data.progress.progress_status, 'documentally_complete');
+  assert.equal(Number(approveObr2.data.progress.progress_percentage), 100);
+
+  const reviewsForObr2 = await httpJson(
+    `${env.apiUrl}/rest/v1/document_reviews?submission_id=eq.${subObr2V1.id}`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(reviewsForObr2.data.length, 1);
+
+  // Aprovar OPC1 posteriormente -> permitido e não duplica process_documentally_completed
+  const approveOpc1 = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subOpc1V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(approveOpc1.status, 200);
+
+  const completeEvents = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?process_id=eq.${procG1Id}&event_type=eq.process_documentally_completed`,
+    { headers: serviceHeaders },
+  );
+  assert.equal(completeEvents.data.length, 1);
+  assert.equal(completeEvents.data[0].metadata.not_official_internship_authorization, true);
+
+  // 7) Submeter OPC2 e revogar assignment de reviewerMod -> bloqueio imediato em fila, download, RPC e timeline
+  const subOpc2V1Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentG.token,
+    processRequirementId: reqGOpc2.id,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: buildValidMinimalPdfBytes(`L4 OPC2 V1 ${runId}`),
+    filename: 'opcional2_l4_v1.pdf',
+  });
+  assert.equal(subOpc2V1Res.status, 201);
+  const subOpc2V1 = subOpc2V1Res.data.submission;
+
+  const revokeMod = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_revoke_reviewer_assignment`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_assignment_id: reviewerModAssignmentId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Revogacao Lote 4 HTTP',
+    },
+  });
+  assert.equal(revokeMod.status, 200);
+
+  const modQueueAfterRevoke = await httpJson(
+    `${env.apiUrl}/rest/v1/reviewer_queue_v?course_id=eq.${catMain.courseId}`,
+    { headers: clientHeaders(reviewerMod.token) },
+  );
+  assert.equal(modQueueAfterRevoke.status, 200);
+  assert.equal(modQueueAfterRevoke.data.length, 0, 'Revisor revogado perde acesso imediato à fila');
+
+  const modDecisionAfterRevoke = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subOpc2V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(modDecisionAfterRevoke.status, 403);
+  assert.equal(modDecisionAfterRevoke.data?.code, '42501');
+
+  const modRetryAfterRevoke = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerMod.token),
+    body: {
+      p_submission_id: subObr1V1.id,
+      p_decision: 'correction_requested',
+      p_reason: corrReason,
+      p_idempotency_key: idemCorrKey,
+    },
+  });
+  assert.equal(modRetryAfterRevoke.status, 403, 'Revisor revogado não recebe nem replay idempotente');
+
+  const modGatewayAfterRevoke = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerMod.token,
+    submissionId: subOpc2V1.id,
+  });
+  assert.equal(modGatewayAfterRevoke.status, 404);
+
+  const modDownloadAfterRevoke = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodeStoragePathSegments(subOpc2V1.storage_path)}`,
+    {
+      headers: {
+        apikey: env.anonKey,
+        Authorization: `Bearer ${reviewerMod.token}`,
+      },
+    },
+  );
+  assert.equal(modDownloadAfterRevoke.ok, false);
+
+  const modTimelineAfterRevoke = await httpJson(
+    `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}`,
+    { headers: clientHeaders(reviewerMod.token) },
+  );
+  assert.equal(modTimelineAfterRevoke.status, 200);
+  assert.equal(modTimelineAfterRevoke.data.length, 0, 'Revisor revogado perde acesso imediato à timeline');
+
+  // reviewerTwin ainda ativo aprova OPC2
+  const twinApproveOpc2 = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerTwin.token),
+    body: {
+      p_submission_id: subOpc2V1.id,
+      p_decision: 'approved',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(twinApproveOpc2.status, 200);
+
+  // 8) ESP-21: Timeline paginada, imutável e isolada por escopo
+  const timelineAll = await httpJson(
+    `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}&order=occurred_at.desc,event_id.desc`,
+    {
+      headers: {
+        ...clientHeaders(studentG.token),
+        Prefer: 'count=exact',
+      },
+    },
+  );
+  assert.equal(timelineAll.status, 200);
+  const totalTimelineEvents = parseContentRangeTotal(timelineAll.headers);
+  assert.ok(totalTimelineEvents >= 12, `Esperados >= 12 eventos na timeline de procG1, obtidos ${totalTimelineEvents}`);
+  assert.equal(timelineAll.data.length, totalTimelineEvents);
+
+  const corrTimelineEntry = timelineAll.data.find(
+    (e) => e.event_type === 'document_correction_requested' && e.submission_id === subObr1V1.id,
+  );
+  assert.ok(corrTimelineEntry, 'Timeline deve conter evento document_correction_requested');
+  assert.equal(corrTimelineEntry.actor_display_name, 'Revisor Modalidade L4');
+  assert.equal(corrTimelineEntry.reason, corrReason);
+  assert.equal(corrTimelineEntry.submission_version, 1);
+
+  const tlPage1 = await httpJson(
+    `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}&order=occurred_at.desc,event_id.desc&limit=5&offset=0`,
+    { headers: { ...clientHeaders(reviewerTwin.token), Prefer: 'count=exact' } },
+  );
+  const tlPage2 = await httpJson(
+    `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}&order=occurred_at.desc,event_id.desc&limit=5&offset=5`,
+    { headers: { ...clientHeaders(reviewerTwin.token), Prefer: 'count=exact' } },
+  );
+  const tlPage3 = await httpJson(
+    `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}&order=occurred_at.desc,event_id.desc&limit=5&offset=10`,
+    { headers: { ...clientHeaders(reviewerTwin.token), Prefer: 'count=exact' } },
+  );
+  assert.equal(tlPage1.ok && tlPage2.ok && tlPage3.ok, true);
+  assert.equal(parseContentRangeTotal(tlPage1.headers), totalTimelineEvents);
+  const combinedTimelineIds = new Set(
+    [...tlPage1.data, ...tlPage2.data, ...tlPage3.data].map((e) => e.event_id),
+  );
+  assert.equal(combinedTimelineIds.size, totalTimelineEvents, 'Paginação da timeline não deve omitir nem duplicar eventos');
+
+  // Isolamento cruzado e imutabilidade da trilha de auditoria
+  for (const [label, tok] of [
+    ['studentH', studentH.token],
+    ['reviewerOther', reviewerOther.token],
+    ['reviewerNone', reviewerNone.token],
+  ]) {
+    const crossTl = await httpJson(
+      `${env.apiUrl}/rest/v1/process_audit_timeline_v?process_id=eq.${procG1Id}`,
+      { headers: clientHeaders(tok) },
+    );
+    assert.equal(crossTl.status, 200);
+    assert.equal(crossTl.data.length, 0, `${label} não pode acessar timeline de procG1`);
+  }
+
+  const patchAudit = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?process_id=eq.${procG1Id}`,
+    {
+      method: 'PATCH',
+      headers: clientHeaders(studentG.token),
+      body: { event_type: 'adulterado' },
+    },
+  );
+  assert.equal(patchAudit.ok, false, 'Estudante não pode alterar audit_events');
+
+  const deleteAudit = await httpJson(
+    `${env.apiUrl}/rest/v1/audit_events?process_id=eq.${procG1Id}`,
+    {
+      method: 'DELETE',
+      headers: clientHeaders(reviewerTwin.token),
+    },
+  );
+  assert.equal(deleteAudit.ok, false, 'Revisor não pode excluir audit_events');
+
+  console.log('✓ Lote 4 (ESP-18/20/21): Fila paginada/filtrada, exclusão de cancelados, download autenticado, review_submission atômica/concorrência/idempotência, ciclo upload->correção->reenvio->aprovação, revogação imediata e timeline imutável validados');
+}
+
+async function runStorageCloudPolicyRegressionScenarios({
+  env,
+  runId,
+  clientHeaders,
+  serviceHeaders,
+  sensitivePool,
+}) {
+  const passOwner = `DemoE3O!${crypto.randomBytes(8).toString('hex')}`;
+  const passOther = `DemoE3F!${crypto.randomBytes(8).toString('hex')}`;
+  const passInactStu = `DemoE3SIn!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevA = `DemoE3R1!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevOut = `DemoE3R2!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevRev = `DemoE3R3!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevInact = `DemoE3R4!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevLogout = `DemoE3RL!${crypto.randomBytes(8).toString('hex')}`;
+  const passRevCourse = `DemoE3RC!${crypto.randomBytes(8).toString('hex')}`;
+  sensitivePool.push(
+    passOwner,
+    passOther,
+    passInactStu,
+    passRevA,
+    passRevOut,
+    passRevRev,
+    passRevInact,
+    passRevLogout,
+    passRevCourse,
+  );
+
+  const studentOwner = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.owner.${runId}@demo.local`,
+    password: passOwner,
+    fullName: 'Estudante Dono E3 Fix',
+  });
+  const studentOther = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.other.${runId}@demo.local`,
+    password: passOther,
+    fullName: 'Estudante Terceiro E3 Fix',
+  });
+  const studentInactive = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.inact.stu.${runId}@demo.local`,
+    password: passInactStu,
+    fullName: 'Estudante Inativo E3 Fix',
+  });
+  const reviewerAssigned = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.rev1.${runId}@demo.local`,
+    password: passRevA,
+    fullName: 'Revisor Atribuido E3 Fix',
+  });
+  const reviewerOut = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.rev2.${runId}@demo.local`,
+    password: passRevOut,
+    fullName: 'Revisor Fora Escopo E3 Fix',
+  });
+  const reviewerRevocable = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.rev3.${runId}@demo.local`,
+    password: passRevRev,
+    fullName: 'Revisor Revogavel E3 Fix',
+  });
+  const reviewerInactive = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.rev4.${runId}@demo.local`,
+    password: passRevInact,
+    fullName: 'Revisor Inativo E3 Fix',
+  });
+  const reviewerTempLogout = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.revlog.${runId}@demo.local`,
+    password: passRevLogout,
+    fullName: 'Revisor Logout E3 Fix',
+  });
+  const reviewerCourse = await createConfirmedAdminUser(env.apiUrl, serviceHeaders, clientHeaders, env.anonKey, sensitivePool, {
+    email: `e3fix.revcurso.${runId}@demo.local`,
+    password: passRevCourse,
+    fullName: 'Revisor Escopo Curso E3 Fix',
+  });
+
+  for (const rev of [
+    reviewerAssigned,
+    reviewerOut,
+    reviewerRevocable,
+    reviewerInactive,
+    reviewerTempLogout,
+    reviewerCourse,
+  ]) {
+    const promote = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_set_user_role`, {
+      method: 'POST',
+      headers: serviceHeaders,
+      body: {
+        p_user_id: rev.id,
+        p_new_role: 'reviewer',
+        p_operator_type: OPERATOR_TYPE,
+        p_operator_identifier: OPERATOR_IDENTIFIER,
+        p_reason: 'Provisionamento regressao Gateway Download PDF (E3-CACHE-FIX)',
+      },
+    });
+    assert.equal(promote.status, 200, `Erro promovendo revisor E3-CACHE-FIX: ${sanitizeHttpSummary(promote)}`);
+  }
+
+  const instOutRes = await httpJson(`${env.apiUrl}/rest/v1/institutions`, {
+    method: 'POST',
+    headers: { ...serviceHeaders, Prefer: 'return=representation' },
+    body: {
+      code: `E3FIX_INST_OUT_${runId}`,
+      name: `Instituicao Outra E3-FIX (${runId})`,
+      is_demo: true,
+      active: true,
+    },
+  });
+  assert.equal(instOutRes.status, 201, `Erro criando instituicao isolada E3-FIX: ${sanitizeHttpSummary(instOutRes)}`);
+  const outInstitutionId = instOutRes.data[0].id;
+
+  const catMain = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    suffix: `E3FIX_A_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `E3FIX_OBR_${runId}`,
+        title: '[Demo E3-FIX] Termo Assinado',
+        description: 'Documento principal para gateway privado',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+      {
+        code: `E3FIX_COLD_${runId}`,
+        title: '[Demo E3-FIX] Documento Nunca Acessado',
+        description: 'Documento frio para teste pos-logout',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: false,
+        displayOrder: 2,
+      },
+      {
+        code: `E3FIX_DISP_${runId}`,
+        title: '[Demo E3-FIX] Documento Removivel',
+        description: 'Documento para testar ausente em storage.objects',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: false,
+        displayOrder: 3,
+      },
+    ],
+  });
+  const catSecondMod = await createIsolatedModalityUnderCourse(env.apiUrl, serviceHeaders, {
+    institutionId: catMain.institutionId,
+    courseId: catMain.courseId,
+    suffix: `E3FIX_MOD2_${runId}`,
+    items: [
+      {
+        code: `E3FIX_MOD2_OBR_${runId}`,
+        title: '[Demo E3-FIX] Segunda Modalidade Mesmo Curso',
+        description: 'Documento segunda modalidade para revisor de curso vs modalidade',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+  const catSiblingCourse = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    institutionId: catMain.institutionId,
+    suffix: `E3FIX_SIBCUR_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `E3FIX_SIBCUR_OBR_${runId}`,
+        title: '[Demo E3-FIX] Outro Curso Mesma Instituicao',
+        description: 'Documento em outro curso da mesma instituicao',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+  const catOut = await createIsolatedCatalogRecord(env.apiUrl, serviceHeaders, {
+    institutionId: outInstitutionId,
+    suffix: `E3FIX_B_${runId}`,
+    templateStatus: 'published',
+    items: [
+      {
+        code: `E3FIX_OUT_${runId}`,
+        title: '[Demo E3-FIX] Outro Escopo',
+        description: 'Outro curso em outra instituicao',
+        acceptanceCriteria: 'PDF valido',
+        isRequired: true,
+        displayOrder: 1,
+      },
+    ],
+  });
+
+  // Regra institucional existente: reviewer_assignments exige course_id NOT NULL (sem curinga global de instituicao)
+  const assignInstitutionNullCourse = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerCourse.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: null,
+      p_course_modality_id: null,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Tentativa institucional sem course_id deve falhar por NOT NULL',
+    },
+  });
+  assert.equal(
+    assignInstitutionNullCourse.ok,
+    false,
+    'Atribuição puramente institucional sem course_id não deve existir no modelo atual',
+  );
+
+  const assignTargets = [
+    [reviewerAssigned.id, catMain],
+    [reviewerOut.id, catOut],
+    [reviewerInactive.id, catMain],
+    [reviewerTempLogout.id, catMain],
+  ];
+  for (const [reviewerId, cat] of assignTargets) {
+    const assign = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+      method: 'POST',
+      headers: serviceHeaders,
+      body: {
+        p_reviewer_id: reviewerId,
+        p_institution_id: cat.institutionId,
+        p_course_id: cat.courseId,
+        p_course_modality_id: cat.modalityId,
+        p_operator_type: OPERATOR_TYPE,
+        p_operator_identifier: OPERATOR_IDENTIFIER,
+        p_reason: 'Assignment regressao Gateway Download PDF',
+      },
+    });
+    assert.equal(assign.status, 200, `Erro atribuindo escopo E3-CACHE-FIX: ${sanitizeHttpSummary(assign)}`);
+  }
+
+  const assignCourse = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerCourse.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: null,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Assignment escopo de curso inteiro (course_modality_id NULL)',
+    },
+  });
+  assert.equal(assignCourse.status, 200, `Erro atribuindo escopo de curso: ${sanitizeHttpSummary(assignCourse)}`);
+  const courseAssignmentId = assignCourse.data.id;
+
+  const assignRevocable = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_assign_reviewer_scope`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_reviewer_id: reviewerRevocable.id,
+      p_institution_id: catMain.institutionId,
+      p_course_id: catMain.courseId,
+      p_course_modality_id: catMain.modalityId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Assignment revogavel regressao Gateway Download PDF',
+    },
+  });
+  assert.equal(assignRevocable.status, 200);
+  const revocableAssignmentId = assignRevocable.data.id;
+
+  // Desativa perfil de reviewerInactive mantendo assignment ativo
+  const deactivateR4 = await httpJson(`${env.apiUrl}/rest/v1/profiles?id=eq.${reviewerInactive.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { active: false },
+  });
+  assert.ok(deactivateR4.status === 200 || deactivateR4.status === 204, `Erro desativando R4: ${sanitizeHttpSummary(deactivateR4)}`);
+
+  const createProc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentOwner.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(createProc.status, 200);
+  const procId = createProc.data.id;
+
+  const reqRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${procId}&select=id,code&order=display_order.asc`,
+    { headers: clientHeaders(studentOwner.token) },
+  );
+  assert.equal(reqRes.status, 200);
+  const reqByCode = Object.fromEntries(reqRes.data.map((r) => [r.code, r.id]));
+  const reqObrId = reqByCode[`E3FIX_OBR_${runId}`];
+  const reqColdId = reqByCode[`E3FIX_COLD_${runId}`];
+  const reqDispId = reqByCode[`E3FIX_DISP_${runId}`];
+  assert.ok(reqObrId && reqColdId && reqDispId, 'Requisitos isolados ausentes');
+
+  const pdfBytes = buildValidMinimalPdfBytes(`E3-CACHE-FIX Principal ${runId}`);
+  const submitRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    processRequirementId: reqObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfBytes,
+    filename: 'e3fix_termo.pdf',
+  });
+  assert.equal(submitRes.status, 201, `Upload E3-CACHE-FIX principal falhou: ${sanitizeHttpSummary(submitRes)}`);
+  const subObrV1 = submitRes.data.submission;
+  const storagePath = subObrV1.storage_path;
+  const encodedPath = encodeStoragePathSegments(storagePath);
+
+  const pdfColdBytes = buildValidMinimalPdfBytes(`E3-CACHE-FIX Cold PDF ${runId}`);
+  const submitColdRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    processRequirementId: reqColdId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfColdBytes,
+    filename: 'e3fix_cold.pdf',
+  });
+  assert.equal(submitColdRes.status, 201, `Upload E3-CACHE-FIX cold falhou: ${sanitizeHttpSummary(submitColdRes)}`);
+  const subCold = submitColdRes.data.submission;
+  const encodedColdPath = encodeStoragePathSegments(subCold.storage_path);
+
+  const pdfDispBytes = buildValidMinimalPdfBytes(`E3-CACHE-FIX Removivel ${runId}`);
+  const submitDispRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    processRequirementId: reqDispId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfDispBytes,
+    filename: 'e3fix_disposable.pdf',
+  });
+  assert.equal(submitDispRes.status, 201);
+  const subDisp = submitDispRes.data.submission;
+
+  // Processo e submissão para validar estudante inativo após envio legítimo
+  const createInactProc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentInactive.token),
+    body: { p_course_modality_id: catMain.modalityId },
+  });
+  assert.equal(createInactProc.status, 200);
+  const reqInactRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${createInactProc.data.id}&select=id,code`,
+    { headers: clientHeaders(studentInactive.token) },
+  );
+  const reqInactObrId = reqInactRes.data.find((r) => r.code === `E3FIX_OBR_${runId}`).id;
+  const pdfInactBytes = buildValidMinimalPdfBytes(`E3-CACHE-FIX Inactive Student ${runId}`);
+  const submitInactRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentInactive.token,
+    processRequirementId: reqInactObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfInactBytes,
+    filename: 'e3fix_inact_student.pdf',
+  });
+  assert.equal(submitInactRes.status, 201);
+  const subInact = submitInactRes.data.submission;
+
+  // Submissões adicionais para regressão de escopo (segunda modalidade do curso, outro curso na mesma instituição e outra instituição)
+  const createMod2Proc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentOther.token),
+    body: { p_course_modality_id: catSecondMod.modalityId },
+  });
+  assert.equal(createMod2Proc.status, 200);
+  const reqMod2Res = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${createMod2Proc.data.id}&select=id,code`,
+    { headers: clientHeaders(studentOther.token) },
+  );
+  const reqMod2ObrId = reqMod2Res.data.find((r) => r.code === `E3FIX_MOD2_OBR_${runId}`).id;
+  const pdfMod2Bytes = buildValidMinimalPdfBytes(`E3-FIX Segunda Modalidade ${runId}`);
+  const submitMod2Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOther.token,
+    processRequirementId: reqMod2ObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfMod2Bytes,
+    filename: 'e3fix_mod2.pdf',
+  });
+  assert.equal(submitMod2Res.status, 201);
+  const subMod2 = submitMod2Res.data.submission;
+
+  const createSibCurProc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentOther.token),
+    body: { p_course_modality_id: catSiblingCourse.modalityId },
+  });
+  assert.equal(createSibCurProc.status, 200);
+  const reqSibCurRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${createSibCurProc.data.id}&select=id,code`,
+    { headers: clientHeaders(studentOther.token) },
+  );
+  const reqSibCurObrId = reqSibCurRes.data.find((r) => r.code === `E3FIX_SIBCUR_OBR_${runId}`).id;
+  const pdfSibCurBytes = buildValidMinimalPdfBytes(`E3-FIX Outro Curso Mesma Inst ${runId}`);
+  const submitSibCurRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOther.token,
+    processRequirementId: reqSibCurObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfSibCurBytes,
+    filename: 'e3fix_sib_cur.pdf',
+  });
+  assert.equal(submitSibCurRes.status, 201);
+  const subSibCur = submitSibCurRes.data.submission;
+
+  const createOutInstProc = await httpJson(`${env.apiUrl}/rest/v1/rpc/create_internship_process`, {
+    method: 'POST',
+    headers: clientHeaders(studentOther.token),
+    body: { p_course_modality_id: catOut.modalityId },
+  });
+  assert.equal(createOutInstProc.status, 200);
+  const reqOutInstRes = await httpJson(
+    `${env.apiUrl}/rest/v1/process_requirements?process_id=eq.${createOutInstProc.data.id}&select=id,code`,
+    { headers: clientHeaders(studentOther.token) },
+  );
+  const reqOutInstObrId = reqOutInstRes.data.find((r) => r.code === `E3FIX_OUT_${runId}`).id;
+  const pdfOutInstBytes = buildValidMinimalPdfBytes(`E3-FIX Outra Inst ${runId}`);
+  const submitOutInstRes = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOther.token,
+    processRequirementId: reqOutInstObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfOutInstBytes,
+    filename: 'e3fix_out_inst.pdf',
+  });
+  assert.equal(submitOutInstRes.status, 201);
+  const subOutInst = submitOutInstRes.data.submission;
+
+  // 1) CORS preflight OPTIONS para Web (gateway Kong responde 200 ou 204; chamada OPTIONS direta na função responde 204)
+  const flutterRequestHeaders = [
+    'apikey', 'authorization', 'cache-control', 'content-type', 'pragma', 'x-client-info',
+  ];
+  const corsPreflight = await fetch(`${env.apiUrl}/functions/v1/download-submission-pdf`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://vicenzobenelli.github.io',
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': flutterRequestHeaders.join(', '),
+    },
+  });
+  assert.equal(
+    corsPreflight.status === 200 || corsPreflight.status === 204,
+    true,
+    `Preflight OPTIONS deve retornar 200 ou 204 (recebeu ${corsPreflight.status})`,
+  );
+  assert.equal(Boolean(corsPreflight.headers.get('access-control-allow-origin')), true);
+  const allowMethods = (corsPreflight.headers.get('access-control-allow-methods') ?? '').toUpperCase();
+  assert.equal(allowMethods.includes('POST'), true);
+  const allowedHeaders = (response) =>
+    (response.headers.get('access-control-allow-headers') ?? '')
+      .toLowerCase().split(',').map((header) => header.trim());
+  for (const header of flutterRequestHeaders) {
+    assert.ok(allowedHeaders(corsPreflight).includes(header), `Preflight não permite ${header}`);
+  }
+  await corsPreflight.body?.cancel();
+
+  const fnOptions = await fetch(`${env.apiUrl}/functions/v1/download-submission-pdf`, {
+    method: 'OPTIONS',
+    headers: { apikey: env.anonKey },
+  });
+  assert.equal(fnOptions.status, 204, `OPTIONS direto na Edge Function deve retornar 204 (recebeu ${fnOptions.status})`);
+  assert.equal(fnOptions.headers.get('access-control-allow-origin'), '*');
+  // OPTIONS direto verifica a lista da função, mesmo quando o proxy espelha o preflight.
+  const fnAllowHeaders = allowedHeaders(fnOptions);
+  assert.ok(!fnAllowHeaders.includes('*'));
+  for (const header of flutterRequestHeaders) {
+    assert.ok(fnAllowHeaders.includes(header), `Edge Function não permite ${header}`);
+  }
+  await fnOptions.body?.cancel();
+
+  // 2) Simular URL direta de Storage previamente aquecida por service_role e comprovar fechamento para clientes
+  const serviceWarmStorage = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/internship-documents/${encodedPath}`,
+    {
+      headers: {
+        apikey: env.serviceRoleKey,
+        Authorization: `Bearer ${env.serviceRoleKey}`,
+      },
+    },
+  );
+  assert.equal(serviceWarmStorage.status, 200);
+  assert.equal(Buffer.compare(serviceWarmStorage.buffer, pdfBytes), 0);
+
+  // Todos os clientes (inclusive dono e revisor autorizado) são bloqueados em TODAS as rotas diretas do Storage
+  for (const [label, tok] of [
+    ['studentOwner', studentOwner.token],
+    ['reviewerAssigned', reviewerAssigned.token],
+    ['reviewerRevocable(pre-revoke)', reviewerRevocable.token],
+  ]) {
+    for (const directEndpoint of [
+      `/storage/v1/object/authenticated/internship-documents/${encodedPath}`,
+      `/storage/v1/object/internship-documents/${encodedPath}`,
+      `/storage/v1/object/info/authenticated/internship-documents/${encodedPath}`,
+      `/storage/v1/object/info/internship-documents/${encodedPath}`,
+    ]) {
+      const directRes = await httpRawBytes(`${env.apiUrl}${directEndpoint}`, {
+        headers: { apikey: env.anonKey, Authorization: `Bearer ${tok}` },
+      });
+      assert.equal(
+        directRes.ok,
+        false,
+        `${label} deve ser bloqueado na rota direta ${directEndpoint} (recebeu ${directRes.status})`,
+      );
+    }
+  }
+
+  // 3) Dono, revisor atribuído e revisor revogável (pré-revogação) baixam byte a byte exclusivamente pelo gateway
+  const ownerGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(ownerGateway.status, 200, `Dono devia baixar PDF pelo gateway (${ownerGateway.status})`);
+  assert.equal((ownerGateway.headers.get('content-type') ?? '').toLowerCase().includes('application/pdf'), true);
+  assert.equal(
+    ownerGateway.headers.get('cache-control')?.toLowerCase(),
+    'private, no-store, no-cache, must-revalidate',
+  );
+  assert.equal(ownerGateway.headers.get('pragma')?.toLowerCase(), 'no-cache');
+  assert.equal(ownerGateway.headers.get('expires'), '0');
+  assert.equal(ownerGateway.headers.get('x-content-type-options')?.toLowerCase(), 'nosniff');
+  assert.equal(Buffer.compare(ownerGateway.buffer, pdfBytes), 0);
+
+  if (env.publishableKey) {
+    const ownerWithPublishable = await httpEdgeDownloadPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.publishableKey,
+      token: studentOwner.token,
+      submissionId: subObrV1.id,
+    });
+    assert.equal(ownerWithPublishable.status, 200);
+    assert.equal(Buffer.compare(ownerWithPublishable.buffer, pdfBytes), 0);
+  }
+
+  const revAssignedGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerAssigned.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(revAssignedGateway.status, 200);
+  assert.equal(Buffer.compare(revAssignedGateway.buffer, pdfBytes), 0);
+
+  // Revisor de curso (course_modality_id NULL): paridade entre RLS (document_submissions) e gateway nas 2 modalidades do curso
+  const rlsCourseMod1 = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?id=eq.${subObrV1.id}&select=id`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(rlsCourseMod1.status, 200);
+  assert.equal(rlsCourseMod1.data.length, 1);
+
+  const revCourseMod1Gateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerCourse.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(
+    revCourseMod1Gateway.status,
+    200,
+    `Revisor de curso deve baixar PDF da modalidade 1 via gateway (recebeu ${revCourseMod1Gateway.status})`,
+  );
+  assert.equal(Buffer.compare(revCourseMod1Gateway.buffer, pdfBytes), 0);
+
+  const rlsCourseMod2 = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?id=eq.${subMod2.id}&select=id`,
+    { headers: clientHeaders(reviewerCourse.token) },
+  );
+  assert.equal(rlsCourseMod2.status, 200);
+  assert.equal(rlsCourseMod2.data.length, 1);
+
+  const revCourseMod2Gateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerCourse.token,
+    submissionId: subMod2.id,
+  });
+  assert.equal(
+    revCourseMod2Gateway.status,
+    200,
+    `Revisor de curso deve baixar PDF da modalidade 2 do mesmo curso via gateway (recebeu ${revCourseMod2Gateway.status})`,
+  );
+  assert.equal(Buffer.compare(revCourseMod2Gateway.buffer, pdfMod2Bytes), 0);
+
+  // Isolamento preservado: outro curso na MESMA instituição e outra instituição permanecem 404 / 0 linhas
+  for (const [revLabel, tok] of [
+    ['reviewerCourse', reviewerCourse.token],
+    ['reviewerAssigned', reviewerAssigned.token],
+  ]) {
+    for (const [targetLabel, deniedSubId] of [
+      ['outro curso na mesma instituicao', subSibCur.id],
+      ['outra instituicao', subOutInst.id],
+    ]) {
+      const rlsDenied = await httpJson(
+        `${env.apiUrl}/rest/v1/document_submissions?id=eq.${deniedSubId}&select=id`,
+        { headers: clientHeaders(tok) },
+      );
+      assert.equal(rlsDenied.status, 200);
+      assert.equal(rlsDenied.data.length, 0, `${revLabel} não pode ver ${targetLabel} na RLS`);
+
+      const gwDenied = await httpEdgeDownloadPdf({
+        apiUrl: env.apiUrl,
+        anonKey: env.anonKey,
+        token: tok,
+        submissionId: deniedSubId,
+      });
+      assert.equal(gwDenied.status, 404, `${revLabel} deve receber 404 no gateway para ${targetLabel}`);
+      assert.equal(gwDenied.data?.error?.code, 'submission_not_found');
+    }
+  }
+
+  // Revisor restrito à modalidade 1 NÃO pode acessar modalidade 2 do mesmo curso
+  const rlsMod1ToMod2Denied = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?id=eq.${subMod2.id}&select=id`,
+    { headers: clientHeaders(reviewerAssigned.token) },
+  );
+  assert.equal(rlsMod1ToMod2Denied.status, 200);
+  assert.equal(rlsMod1ToMod2Denied.data.length, 0);
+
+  const gwMod1ToMod2Denied = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerAssigned.token,
+    submissionId: subMod2.id,
+  });
+  assert.equal(gwMod1ToMod2Denied.status, 404, 'Revisor de modalidade específica não pode acessar outra modalidade do mesmo curso');
+  assert.equal(gwMod1ToMod2Denied.data?.error?.code, 'submission_not_found');
+
+  // Captura requisição exata do revisor revogável antes da revogação para replay idêntico pós-revogação
+  const revReplayUrl = `${env.apiUrl}/functions/v1/download-submission-pdf`;
+  const revReplayHeaders = {
+    apikey: env.anonKey,
+    Authorization: `Bearer ${reviewerRevocable.token}`,
+    'Content-Type': 'application/json',
+  };
+  const revReplayBody = JSON.stringify({ submission_id: subObrV1.id });
+
+  const revBeforeRevokeResp = await fetch(revReplayUrl, {
+    method: 'POST',
+    headers: revReplayHeaders,
+    body: revReplayBody,
+  });
+  const revBeforeBuf = Buffer.from(await revBeforeRevokeResp.arrayBuffer());
+  assert.equal(revBeforeRevokeResp.status, 200, 'Revisor revogável deve baixar antes da revogação');
+  assert.equal(Buffer.compare(revBeforeBuf, pdfBytes), 0);
+
+  // Controle positivo de list/list-v2 com service_role antes da v2 (exatamente 1 objeto em E3FIX_OBR)
+  const svcList = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: { prefix: `processes/${procId}/requirements/${reqObrId}/submissions`, limit: 20, offset: 0 },
+  });
+  assert.equal(svcList.status, 200);
+  assert.equal(Array.isArray(svcList.data) && svcList.data.length === 1, true);
+
+  const svcListV2 = await httpJson(`${env.apiUrl}/storage/v1/object/list-v2/internship-documents`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: { prefix: `processes/${procId}/requirements/${reqObrId}/submissions/`, limit: 20 },
+  });
+  assert.equal(svcListV2.status, 200);
+  assert.equal(Array.isArray(svcListV2.data?.objects) && svcListV2.data.objects.length === 1, true);
+
+  // 4) Revogação do revisor e REPLAY EXATO da mesma requisição HTTP imediatamente após revogar
+  const revokeR3 = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_revoke_reviewer_assignment`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_assignment_id: revocableAssignmentId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Revogacao imediata E3-CACHE-FIX HTTP',
+    },
+  });
+  assert.equal(revokeR3.status, 200);
+
+  const revExactReplayResp = await fetch(revReplayUrl, {
+    method: 'POST',
+    headers: revReplayHeaders,
+    body: revReplayBody,
+  });
+  const revExactReplayText = await revExactReplayResp.text();
+  assert.equal(
+    revExactReplayResp.status,
+    404,
+    `Replay exato pós-revogação deve falhar imediatamente com 404 (recebeu ${revExactReplayResp.status})`,
+  );
+  assert.equal(revExactReplayText.includes('%PDF-'), false);
+
+  // 5) Matriz negativa no gateway (zero oracle entre submissão alheia, fora de escopo, revogado e inexistente)
+  const nonexistentGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOther.token,
+    submissionId: '00000000-0000-4000-8000-000000000999',
+  });
+  const foreignStudentGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOther.token,
+    submissionId: subObrV1.id,
+  });
+  const outScopeGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerOut.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(nonexistentGateway.status, 404);
+  assert.equal(foreignStudentGateway.status, 404);
+  assert.equal(outScopeGateway.status, 404);
+  assert.deepEqual(foreignStudentGateway.data, nonexistentGateway.data, 'Resposta de submissão alheia não pode vazar existência');
+  assert.deepEqual(outScopeGateway.data, nonexistentGateway.data, 'Resposta fora do escopo não pode vazar existência');
+
+  const inactiveRevGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerInactive.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(inactiveRevGateway.status, 403);
+  assert.equal(inactiveRevGateway.data?.error?.code, 'forbidden_inactive_profile');
+
+  // Estudante inativo: confirma sucesso antes de desativar e bloqueio imediato após desativação
+  const activeInactStuBefore = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentInactive.token,
+    submissionId: subInact.id,
+  });
+  assert.equal(activeInactStuBefore.status, 200);
+  const deactivateStu = await httpJson(`${env.apiUrl}/rest/v1/profiles?id=eq.${studentInactive.id}`, {
+    method: 'PATCH',
+    headers: serviceHeaders,
+    body: { active: false },
+  });
+  assert.ok(deactivateStu.status === 200 || deactivateStu.status === 204);
+  const inactiveStuGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentInactive.token,
+    submissionId: subInact.id,
+  });
+  assert.equal(inactiveStuGateway.status, 403);
+  assert.equal(inactiveStuGateway.data?.error?.code, 'forbidden_inactive_profile');
+
+  // Anônimo, JWT inválido e JWT expirado
+  const anonGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: null,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(anonGateway.status, 401);
+  assert.equal(anonGateway.data?.error?.code, 'missing_authorization');
+
+  const invalidJwtGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: 'invalid.jwt.token',
+    submissionId: subObrV1.id,
+  });
+  assert.equal(invalidJwtGateway.status, 401);
+  assert.equal(invalidJwtGateway.data?.error?.code, 'invalid_or_expired_session');
+
+  const jwtParts = studentOwner.token.split('.');
+  const sigBytes = Buffer.from(jwtParts[2], 'base64url');
+  sigBytes[0] ^= 1;
+  const tamperedUserJwt = [jwtParts[0], jwtParts[1], sigBytes.toString('base64url')].join('.');
+  sensitivePool.push(tamperedUserJwt);
+  const tamperedJwtGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: tamperedUserJwt,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(tamperedJwtGateway.status, 401);
+  assert.equal(tamperedJwtGateway.data?.error?.code, 'invalid_or_expired_session');
+
+  if (env.jwtSecret) {
+    const ownerClaims = JSON.parse(
+      Buffer.from(studentOwner.token.split('.')[1], 'base64url').toString('utf8'),
+    );
+    const expiredJwt = mintLocalSignedJwt({
+      userId: studentOwner.id,
+      jwtSecret: env.jwtSecret,
+      expOffsetSeconds: -600,
+    });
+    const expiredJwtSameSession = mintLocalSignedJwt({
+      userId: studentOwner.id,
+      jwtSecret: env.jwtSecret,
+      expOffsetSeconds: -600,
+      aud: ownerClaims.aud ?? 'authenticated',
+    });
+    sensitivePool.push(expiredJwt, expiredJwtSameSession);
+
+    const authDirectExpired = await httpJson(`${env.apiUrl}/auth/v1/user`, {
+      headers: clientHeaders(expiredJwtSameSession),
+    });
+    assert.equal(authDirectExpired.ok, false);
+    assert.equal(String(authDirectExpired.data?.msg ?? '').toLowerCase().includes('expired'), true);
+
+    const expiredJwtGateway = await httpEdgeDownloadPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: expiredJwt,
+      submissionId: subObrV1.id,
+    });
+    assert.equal(expiredJwtGateway.status, 401);
+    assert.equal(expiredJwtGateway.data?.error?.code, 'invalid_or_expired_session');
+  }
+
+  // 6) Global logout com JWT retido: falha imediata no gateway para PDF previamente baixado E PDF nunca acessado
+  const preLogoutWarmDownload = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: reviewerTempLogout.token,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(preLogoutWarmDownload.status, 200);
+
+  const logoutGlobal = await httpJson(`${env.apiUrl}/auth/v1/logout?scope=global`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerTempLogout.token),
+  });
+  assert.equal(logoutGlobal.status, 204);
+
+  const retainedToken = reviewerTempLogout.token;
+  const postLogoutWarmGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: retainedToken,
+    submissionId: subObrV1.id,
+  });
+  assert.equal(postLogoutWarmGateway.status, 401, 'JWT retido pós-logout global deve falhar no gateway para PDF já baixado');
+  assert.equal(postLogoutWarmGateway.data?.error?.code, 'invalid_or_expired_session');
+
+  const postLogoutColdGateway = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: retainedToken,
+    submissionId: subCold.id,
+  });
+  assert.equal(postLogoutColdGateway.status, 401, 'JWT retido pós-logout global deve falhar no gateway para PDF nunca acessado');
+  assert.equal(postLogoutColdGateway.data?.error?.code, 'invalid_or_expired_session');
+
+  const postLogoutDirectColdStorage = await httpRawBytes(
+    `${env.apiUrl}/storage/v1/object/authenticated/internship-documents/${encodedColdPath}`,
+    { headers: { apikey: env.anonKey, Authorization: `Bearer ${retainedToken}` } },
+  );
+  assert.equal(postLogoutDirectColdStorage.ok, false);
+
+  // Contraste documentado com PostgREST stateless (metadados ainda usam assinatura JWT até exp; download PDF revoga na hora)
+  const postLogoutPostgrest = await httpJson(
+    `${env.apiUrl}/rest/v1/document_submissions?id=eq.${subObrV1.id}&select=id`,
+    { headers: clientHeaders(retainedToken) },
+  );
+  assert.equal(postLogoutPostgrest.status, 200);
+
+  // 7) Entradas malformadas e proibição de bucket / storage_path fornecidos pelo cliente
+  const clientBucketAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    bodyOverride: { submission_id: subObrV1.id, bucket: 'internship-documents' },
+  });
+  assert.equal(clientBucketAttempt.status, 400);
+  assert.equal(clientBucketAttempt.data?.error?.code, 'unsupported_destination_parameter');
+
+  const clientPathAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    bodyOverride: { submission_id: subObrV1.id, storage_path: storagePath },
+  });
+  assert.equal(clientPathAttempt.status, 400);
+  assert.equal(clientPathAttempt.data?.error?.code, 'unsupported_destination_parameter');
+
+  const extraKeyAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    bodyOverride: { submission_id: subObrV1.id, extra_param: 'ignored' },
+  });
+  assert.equal(extraKeyAttempt.status, 400);
+  assert.equal(extraKeyAttempt.data?.error?.code, 'unexpected_request_parameter');
+
+  const malformedJsonAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    rawBody: '{bad-json',
+  });
+  assert.equal(malformedJsonAttempt.status, 400);
+  assert.equal(malformedJsonAttempt.data?.error?.code, 'invalid_json_payload');
+
+  const invalidUuidAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    bodyOverride: { submission_id: '../secret.pdf' },
+  });
+  assert.equal(invalidUuidAttempt.status, 400);
+  assert.equal(invalidUuidAttempt.data?.error?.code, 'invalid_submission_id');
+
+  const badContentTypeAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    rawBody: JSON.stringify({ submission_id: subObrV1.id }),
+    contentType: 'text/plain',
+  });
+  assert.equal(badContentTypeAttempt.status, 415);
+
+  const wrongMethodAttempt = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    method: 'GET',
+    contentType: null,
+  });
+  assert.equal(wrongMethodAttempt.status, 405);
+
+  // 8) Versões históricas (v1 + v2) preservadas no gateway para dono e revisor ativo
+  const revRequestCorr = await httpJson(`${env.apiUrl}/rest/v1/rpc/review_submission`, {
+    method: 'POST',
+    headers: clientHeaders(reviewerAssigned.token),
+    body: {
+      p_submission_id: subObrV1.id,
+      p_decision: 'correction_requested',
+      p_reason: 'Solicitar v2 para regressao historica E3-CACHE-FIX',
+      p_idempotency_key: crypto.randomUUID(),
+    },
+  });
+  assert.equal(revRequestCorr.status, 200);
+
+  const pdfV2Bytes = buildValidMinimalPdfBytes(`E3-CACHE-FIX Versao 2 ${runId}`);
+  const submitV2Res = await httpEdgeSubmitPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    processRequirementId: reqObrId,
+    idempotencyKey: crypto.randomUUID(),
+    fileBytes: pdfV2Bytes,
+    filename: 'e3fix_termo_v2.pdf',
+  });
+  assert.equal(submitV2Res.status, 201);
+  const subObrV2 = submitV2Res.data.submission;
+
+  for (const [roleLabel, tok] of [
+    ['owner', studentOwner.token],
+    ['reviewerAssigned', reviewerAssigned.token],
+    ['reviewerCourse', reviewerCourse.token],
+  ]) {
+    const histV1 = await httpEdgeDownloadPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: tok,
+      submissionId: subObrV1.id,
+    });
+    const histV2 = await httpEdgeDownloadPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: tok,
+      submissionId: subObrV2.id,
+    });
+    assert.equal(histV1.status, 200, `${roleLabel} devia acessar v1 histórica após v2`);
+    assert.equal(histV2.status, 200, `${roleLabel} devia acessar v2 vigente`);
+    assert.equal(Buffer.compare(histV1.buffer, pdfBytes), 0);
+    assert.equal(Buffer.compare(histV2.buffer, pdfV2Bytes), 0);
+  }
+
+  // Revogação do revisor de curso bloqueia imediatamente MOD_1 (v1 + v2) e MOD_2 no gateway
+  const revokeCourse = await httpJson(`${env.apiUrl}/rest/v1/rpc/admin_revoke_reviewer_assignment`, {
+    method: 'POST',
+    headers: serviceHeaders,
+    body: {
+      p_assignment_id: courseAssignmentId,
+      p_operator_type: OPERATOR_TYPE,
+      p_operator_identifier: OPERATOR_IDENTIFIER,
+      p_reason: 'Revogacao imediata do escopo de curso E3-GATEWAY-FIX-BE',
+    },
+  });
+  assert.equal(revokeCourse.status, 200);
+
+  for (const revokedSubId of [subObrV1.id, subObrV2.id, subMod2.id]) {
+    const revokedGw = await httpEdgeDownloadPdf({
+      apiUrl: env.apiUrl,
+      anonKey: env.anonKey,
+      token: reviewerCourse.token,
+      submissionId: revokedSubId,
+    });
+    assert.equal(revokedGw.status, 404, `Revisor de curso revogado deve receber 404 imediato para ${revokedSubId}`);
+    assert.equal(revokedGw.data?.error?.code, 'submission_not_found');
+  }
+
+  // 9) Objeto ausente no Storage após vínculo retorna 404 seguro
+  const dispBeforeDelete = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    submissionId: subDisp.id,
+  });
+  assert.equal(dispBeforeDelete.status, 200);
+
+  const svcDeleteDisp = await httpJson(`${env.apiUrl}/storage/v1/object/internship-documents`, {
+    method: 'DELETE',
+    headers: serviceHeaders,
+    body: { prefixes: [subDisp.storage_path] },
+  });
+  assert.equal(svcDeleteDisp.status, 200);
+
+  const dispAfterDelete = await httpEdgeDownloadPdf({
+    apiUrl: env.apiUrl,
+    anonKey: env.anonKey,
+    token: studentOwner.token,
+    submissionId: subDisp.id,
+  });
+  assert.equal(dispAfterDelete.status, 404);
+  assert.equal(dispAfterDelete.data?.error?.code, 'submission_not_found');
+
+  // 10) Preservação dos bloqueios diretos no Storage para anônimos, não autorizados e operações proibidas (dono/revisor)
+  for (const [label, hdrs] of [
+    ['anon', { apikey: env.anonKey }],
+    ['studentOther', clientHeaders(studentOther.token)],
+    ['reviewerOut', clientHeaders(reviewerOut.token)],
+    ['reviewerRevoked', clientHeaders(reviewerRevocable.token)],
+    ['reviewerInactive', clientHeaders(reviewerInactive.token)],
+  ]) {
+    for (const blockedPath of [
+      `/storage/v1/object/authenticated/internship-documents/${encodedPath}`,
+      `/storage/v1/object/internship-documents/${encodedPath}`,
+      `/storage/v1/object/info/authenticated/internship-documents/${encodedPath}`,
+      `/storage/v1/object/info/internship-documents/${encodedPath}`,
+    ]) {
+      const res = await httpRawBytes(`${env.apiUrl}${blockedPath}`, { headers: hdrs });
+      assert.equal(res.ok, false, `${label} deveria ser bloqueado em ${blockedPath} (recebeu ${res.status})`);
+    }
+  }
+
+  for (const [label, tok] of [
+    ['studentOwner', studentOwner.token],
+    ['reviewerAssigned', reviewerAssigned.token],
+  ]) {
+    for (const headEndpoint of [
+      `/storage/v1/object/authenticated/internship-documents/${encodedPath}`,
+      `/storage/v1/object/internship-documents/${encodedPath}`,
+    ]) {
+      const headRes = await httpRawBytes(`${env.apiUrl}${headEndpoint}`, {
+        method: 'HEAD',
+        headers: { apikey: env.anonKey, Authorization: `Bearer ${tok}` },
+      });
+      assert.equal(headRes.ok, false, `${label}: HEAD em ${headEndpoint} deve permanecer bloqueado (${headRes.status})`);
+    }
+
+    const signRes = await httpJson(`${env.apiUrl}/storage/v1/object/sign/internship-documents/${encodedPath}`, {
+      method: 'POST',
+      headers: clientHeaders(tok),
+      body: { expiresIn: 60 },
+    });
+    assert.equal(signRes.ok, false, `${label}: object.sign deve permanecer bloqueado (${signRes.status})`);
+
+    const signManyRes = await httpJson(`${env.apiUrl}/storage/v1/object/sign/internship-documents`, {
+      method: 'POST',
+      headers: clientHeaders(tok),
+      body: { expiresIn: 60, paths: [storagePath] },
+    });
+    assert.equal(
+      !signManyRes.ok ||
+        (Array.isArray(signManyRes.data) && signManyRes.data.every((i) => i && i.signedURL === null && Boolean(i.error))),
+      true,
+      `${label}: object.sign_many deve permanecer bloqueado`,
+    );
+
+    const listRes = await httpJson(`${env.apiUrl}/storage/v1/object/list/internship-documents`, {
+      method: 'POST',
+      headers: clientHeaders(tok),
+      body: { prefix: `processes/${procId}/requirements/${reqObrId}/submissions`, limit: 20, offset: 0 },
+    });
+    assert.equal(
+      !listRes.ok || (Array.isArray(listRes.data) && listRes.data.length === 0),
+      true,
+      `${label}: object.list não pode retornar objetos mesmo com prefixo exato`,
+    );
+
+    const listV2Res = await httpJson(`${env.apiUrl}/storage/v1/object/list-v2/internship-documents`, {
+      method: 'POST',
+      headers: clientHeaders(tok),
+      body: { prefix: `processes/${procId}/requirements/${reqObrId}/submissions/`, limit: 20 },
+    });
+    assert.equal(
+      !listV2Res.ok || (Array.isArray(listV2Res.data?.objects) && listV2Res.data.objects.length === 0),
+      true,
+      `${label}: object.list_v2 não pode retornar objetos mesmo com prefixo exato`,
+    );
+
+    for (const pubEndpoint of [
+      `/storage/v1/object/public/internship-documents/${encodedPath}`,
+      `/storage/v1/object/info/public/internship-documents/${encodedPath}`,
+    ]) {
+      const pubRes = await httpRawBytes(`${env.apiUrl}${pubEndpoint}`, {
+        headers: { apikey: env.anonKey, Authorization: `Bearer ${tok}` },
+      });
+      assert.equal(pubRes.ok, false, `${label}: rota pública ${pubEndpoint} deve permanecer bloqueada`);
+    }
+  }
+
+  console.log('✓ Gate E3-CACHE-FIX (Grupo 20): Gateway download-submission-pdf (dono/revisor/histórico v1+v2/headers/CORS/replay revogado/logout warm+cold/inativos/JWT expirado/sem oracle/destino rejeitado) e bloqueio total do Storage direto validados');
 }
 
 function apiUrlOr(url) {

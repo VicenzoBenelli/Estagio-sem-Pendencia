@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../../../core/responsive/app_breakpoints.dart';
 import '../../auth/domain/user_profile.dart';
+import '../../review/application/process_timeline_controller.dart';
+import '../../review/presentation/process_audit_timeline_section.dart';
 import '../application/document_submission_controller.dart';
 import '../application/process_controller.dart';
 import '../domain/process_models.dart';
@@ -14,12 +16,14 @@ class StudentProcessesWorkspace extends StatefulWidget {
     required this.profile,
     required this.controller,
     this.documentController,
+    this.timelineController,
     super.key,
   });
 
   final UserProfile profile;
   final ProcessController controller;
   final DocumentSubmissionController? documentController;
+  final ProcessTimelineController? timelineController;
 
   @override
   State<StudentProcessesWorkspace> createState() =>
@@ -44,7 +48,8 @@ class _StudentProcessesWorkspaceState extends State<StudentProcessesWorkspace> {
       widget.controller.addListener(_syncDocumentsIfDetailChanged);
       _lastSyncedDetailBundle = null;
     }
-    if (oldWidget.documentController != widget.documentController) {
+    if (oldWidget.documentController != widget.documentController ||
+        oldWidget.timelineController != widget.timelineController) {
       _lastSyncedDetailBundle = null;
     }
     if (oldWidget.profile.id != widget.profile.id ||
@@ -56,14 +61,19 @@ class _StudentProcessesWorkspaceState extends State<StudentProcessesWorkspace> {
 
   void _syncDocumentsIfDetailChanged() {
     final docCtrl = widget.documentController;
-    if (docCtrl == null) return;
+    final timelineCtrl = widget.timelineController;
+    if (docCtrl == null && timelineCtrl == null) return;
     if (widget.controller.subView == StudentProcessSubView.detail &&
         widget.controller.detailStatus == ProcessLoadStatus.loaded &&
         widget.controller.detailBundle != null) {
       final bundle = widget.controller.detailBundle!;
       if (!identical(bundle, _lastSyncedDetailBundle)) {
         _lastSyncedDetailBundle = bundle;
-        docCtrl.syncWithProcessDetail(bundle);
+        docCtrl?.syncWithProcessDetail(bundle);
+        if (timelineCtrl != null &&
+            timelineCtrl.activeProcessId != bundle.process.id) {
+          unawaited(timelineCtrl.loadTimeline(bundle.process.id));
+        }
       }
     }
   }
@@ -119,6 +129,7 @@ class _StudentProcessesWorkspaceState extends State<StudentProcessesWorkspace> {
                           StudentProcessSubView.detail => _ProcessDetailView(
                             controller: widget.controller,
                             documentController: widget.documentController,
+                            timelineController: widget.timelineController,
                             userRole: widget.profile.role,
                             compact: compact,
                           ),
@@ -794,12 +805,14 @@ class _ProcessDetailView extends StatelessWidget {
   const _ProcessDetailView({
     required this.controller,
     required this.documentController,
+    required this.timelineController,
     required this.userRole,
     required this.compact,
   });
 
   final ProcessController controller;
   final DocumentSubmissionController? documentController;
+  final ProcessTimelineController? timelineController;
   final UserRole userRole;
   final bool compact;
 
@@ -835,6 +848,10 @@ class _ProcessDetailView extends StatelessWidget {
                           unawaited(controller.refreshActiveDetail());
                           unawaited(
                             documentController?.reloadExpandedHistories() ??
+                                Future<void>.value(),
+                          );
+                          unawaited(
+                            timelineController?.refresh() ??
                                 Future<void>.value(),
                           );
                         },
@@ -874,6 +891,7 @@ class _ProcessDetailView extends StatelessWidget {
                     : _ProcessDetailLoadedContent(
                         bundle: controller.detailBundle!,
                         documentController: documentController,
+                        timelineController: timelineController,
                         userRole: userRole,
                         textTheme: textTheme,
                         colors: colors,
@@ -938,6 +956,7 @@ class _ProcessDetailLoadedContent extends StatelessWidget {
   const _ProcessDetailLoadedContent({
     required this.bundle,
     required this.documentController,
+    required this.timelineController,
     required this.userRole,
     required this.textTheme,
     required this.colors,
@@ -945,6 +964,7 @@ class _ProcessDetailLoadedContent extends StatelessWidget {
 
   final ProcessDetailBundle bundle;
   final DocumentSubmissionController? documentController;
+  final ProcessTimelineController? timelineController;
   final UserRole userRole;
   final TextTheme textTheme;
   final ColorScheme colors;
@@ -1034,6 +1054,10 @@ class _ProcessDetailLoadedContent extends StatelessWidget {
             ),
             const SizedBox(height: 12),
           ],
+        if (timelineController != null) ...[
+          const SizedBox(height: 12),
+          ProcessAuditTimelineSection(controller: timelineController!),
+        ],
       ],
     );
   }

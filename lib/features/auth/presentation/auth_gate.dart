@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import '../../../core/responsive/app_breakpoints.dart';
 import '../../processes/domain/document_repository.dart';
 import '../../processes/domain/process_repository.dart';
+import '../../review/data/pdf_document_renderer.dart';
+import '../../review/domain/review_repository.dart';
 import '../application/auth_controller.dart';
 import 'auth_screen.dart';
 import 'reset_password_page.dart';
@@ -14,6 +16,8 @@ class AuthGate extends StatelessWidget {
     this.processRepository,
     this.documentRepository,
     this.pdfPickerGateway,
+    this.reviewRepository,
+    this.pdfRendererGateway,
     super.key,
   });
 
@@ -21,6 +25,8 @@ class AuthGate extends StatelessWidget {
   final ProcessRepository? processRepository;
   final DocumentRepository? documentRepository;
   final PdfPickerGateway? pdfPickerGateway;
+  final ReviewRepository? reviewRepository;
+  final PdfRendererGateway? pdfRendererGateway;
 
   @override
   Widget build(BuildContext context) {
@@ -55,11 +61,15 @@ class AuthGate extends StatelessWidget {
             processRepository: processRepository,
             documentRepository: documentRepository,
             pdfPickerGateway: pdfPickerGateway,
+            reviewRepository: reviewRepository,
           ),
           AuthViewStatus.authenticatedReviewer => ReviewerHomePage(
             key: ValueKey('reviewer_home_${profile?.id ?? ''}'),
             profile: profile!,
             controller: controller,
+            reviewRepository: reviewRepository,
+            pdfPickerGateway: pdfPickerGateway,
+            pdfRendererGateway: pdfRendererGateway,
           ),
         };
       },

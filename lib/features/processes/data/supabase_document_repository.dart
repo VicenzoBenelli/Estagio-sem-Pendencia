@@ -1,25 +1,58 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart'
     as http
-    show MultipartFile, MediaType, RequestAbortedException, ClientException;
+    show
+        AbortableRequest,
+        Client,
+        ClientException,
+        MediaType,
+        MultipartFile,
+        RequestAbortedException,
+        StreamedResponse;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../domain/document_models.dart';
 import '../domain/document_repository.dart';
 import '../domain/process_models.dart';
 
+const int _kMaxGatewayErrorBodyBytes = 64 * 1024;
+
+class GatewayDownloadStreamMetrics {
+  const GatewayDownloadStreamMetrics({
+    required this.chunksConsumed,
+    required this.totalBytesReceived,
+    required this.maxBytesAccumulated,
+    required this.retainedBytesAfterCancel,
+    required this.subscriptionCancelled,
+    required this.rejectedByContentLength,
+  });
+
+  final int chunksConsumed;
+  final int totalBytesReceived;
+  final int maxBytesAccumulated;
+  final int retainedBytesAfterCancel;
+  final bool subscriptionCancelled;
+  final bool rejectedByContentLength;
+}
+
 class SupabaseDocumentRepository implements DocumentRepository {
   const SupabaseDocumentRepository(
     this._client, {
     this.uploadTimeout = const Duration(seconds: 30),
     this.downloadTimeout = const Duration(seconds: 30),
+    @visibleForTesting this.debugOnDownloadMetrics,
   });
 
   final SupabaseClient _client;
   final Duration uploadTimeout;
   final Duration downloadTimeout;
+  @visibleForTesting
+  final void Function(GatewayDownloadStreamMetrics metrics)?
+  debugOnDownloadMetrics;
 
   static const String _submissionColumns =
       'id, process_id, process_requirement_id, submitted_by, version, '
@@ -29,6 +62,11 @@ class SupabaseDocumentRepository implements DocumentRepository {
   static const String _reviewColumns =
       'id, process_id, process_requirement_id, submission_id, reviewer_id, '
       'decision, reason, reviewed_at';
+
+  static final RegExp _uuidRegex = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  );
 
   @override
   Future<SubmitPdfOutcome> submitRequirementPdf({
@@ -198,37 +236,41 @@ class SupabaseDocumentRepository implements DocumentRepository {
     }
   }
 
+  static bool isValidUuid(String value) => _uuidRegex.hasMatch(value);
+
   @override
   Future<Uint8List> downloadSubmissionBytes({
-    required String storageBucket,
-    required String storagePath,
+    required String submissionId,
   }) async {
-    final normalizedBucket = storageBucket.trim();
-    final normalizedPath = storagePath.trim();
-    if (normalizedBucket != kPrivateDocumentsBucket ||
-        normalizedPath.isEmpty ||
-        normalizedPath.contains('..') ||
-        normalizedPath.startsWith('/')) {
-      throw const DocumentFailure(
-        'Referência de documento inválida ou não autorizada.',
-        code: 'invalid_storage_reference',
-        httpStatus: 400,
-      );
-    }
-
     try {
-      final bytes = await _client.storage
-          .from(normalizedBucket)
-          .download(normalizedPath)
-          .timeout(downloadTimeout);
-
-      if (bytes.isEmpty) {
-        throw const DocumentFailure(
+      return await downloadPrivateSubmissionPdfFromGateway(
+        client: _client,
+        submissionId: submissionId,
+        timeout: downloadTimeout,
+        debugOnDownloadMetrics: debugOnDownloadMetrics,
+        onInvalidSubmissionId: () => const DocumentFailure(
+          'Identificador de submissão inválido ou não autorizado.',
+          code: 'invalid_submission_id',
+          httpStatus: 400,
+        ),
+        onInvalidContentType: () => const DocumentFailure(
+          'Resposta inesperada do servidor ao baixar o documento PDF.',
+          code: 'invalid_pdf_content_type',
+        ),
+        onEmptyFile: () => const DocumentFailure(
           'O arquivo retornado pelo armazenamento privado está vazio.',
           code: 'empty_downloaded_file',
-        );
-      }
-      return bytes;
+        ),
+        onFileTooLarge: () => const DocumentFailure(
+          'O arquivo PDF ultrapassa o limite máximo permitido de 5 MiB.',
+          code: 'file_too_large',
+          httpStatus: 413,
+        ),
+        onInvalidPdfSignature: () => const DocumentFailure(
+          'Os bytes retornados não possuem assinatura válida de documento PDF (%PDF-).',
+          code: 'invalid_pdf_signature',
+        ),
+      );
     } on DocumentFailure {
       rethrow;
     } catch (error) {
@@ -355,12 +397,17 @@ class SupabaseDocumentRepository implements DocumentRepository {
           'empty_file' => 'O arquivo PDF enviado está vazio.',
           'invalid_file_extension' =>
             'Nome de arquivo inválido; apenas documentos .pdf são aceitos.',
+          'invalid_submission_id' =>
+            'Identificador de submissão documental inválido.',
+          'unsupported_destination_parameter' ||
+          'unexpected_request_parameter' =>
+            'Parâmetros de destino não são aceitos pelo servidor.',
           _ => 'Parâmetros ou arquivo inválidos para envio. Verifique o PDF selecionado.',
         };
         return DocumentFailure(msg, code: backendCode, httpStatus: 400);
       case 401:
         return DocumentFailure(
-          'Sua sessão expirou ou é inválida. Entre novamente para enviar documentos.',
+          'Sua sessão expirou ou é inválida. Entre novamente para acessar ou enviar documentos.',
           code: backendCode ?? 'unauthorized',
           httpStatus: 401,
           isUnauthorized: true,
@@ -371,18 +418,32 @@ class SupabaseDocumentRepository implements DocumentRepository {
             'Processo cancelado não aceita novas submissões.',
           'forbidden_role' =>
             'Apenas estudantes com perfil ativo podem enviar documentos.',
-          _ => 'Você não tem permissão para enviar arquivo neste requisito.',
+          'forbidden_inactive_profile' =>
+            'Seu perfil está inativo ou sem permissão para acessar documentos.',
+          _ => 'Você não tem permissão para acessar ou enviar arquivo neste requisito.',
         };
         return DocumentFailure(
           msg,
           code: backendCode ?? 'forbidden',
           httpStatus: 403,
+          isUnauthorized: true,
         );
       case 404:
+        final msg = switch (backendCode) {
+          'submission_not_found' || 'storage_object_missing' =>
+            'Submissão documental não encontrada ou acesso indisponível.',
+          _ => 'Requisito não encontrado ou inacessível para sua conta.',
+        };
         return DocumentFailure(
-          'Requisito não encontrado ou inacessível para sua conta.',
+          msg,
           code: backendCode ?? 'not_found',
           httpStatus: 404,
+        );
+      case 405:
+        return DocumentFailure(
+          'Método HTTP não permitido para esta operação documental.',
+          code: backendCode ?? 'method_not_allowed',
+          httpStatus: 405,
         );
       case 409:
         final msg = switch (backendCode) {
@@ -455,5 +516,393 @@ class SupabaseDocumentRepository implements DocumentRepository {
     if (raw is num) return raw.toInt();
     if (raw is String) return int.tryParse(raw) ?? fallback;
     return fallback;
+  }
+}
+
+Future<Uint8List> downloadPrivateSubmissionPdfFromGateway({
+  required SupabaseClient client,
+  required String submissionId,
+  required Duration timeout,
+  required Exception Function() onInvalidSubmissionId,
+  required Exception Function() onInvalidContentType,
+  required Exception Function() onEmptyFile,
+  required Exception Function() onFileTooLarge,
+  required Exception Function() onInvalidPdfSignature,
+  int maxBytes = kMaxPdfSizeBytes,
+  void Function(GatewayDownloadStreamMetrics metrics)? debugOnDownloadMetrics,
+}) async {
+  final cleanSubmissionId = submissionId.trim();
+  if (cleanSubmissionId.isEmpty ||
+      !SupabaseDocumentRepository.isValidUuid(cleanSubmissionId)) {
+    throw onInvalidSubmissionId();
+  }
+
+  final restUrl = client.rest.url.replaceAll(RegExp(r'/+$'), '');
+  final baseUrl = restUrl.endsWith('/rest/v1')
+      ? restUrl.substring(0, restUrl.length - '/rest/v1'.length)
+      : restUrl;
+  final uri = Uri.parse('$baseUrl/functions/v1/download-submission-pdf');
+
+  final abortCompleter = Completer<void>();
+  final request = http.AbortableRequest(
+    'POST',
+    uri,
+    abortTrigger: abortCompleter.future,
+  );
+  final clientInfo =
+      client.functions.headers['X-Client-Info'] ??
+      client.functions.headers['x-client-info'];
+  if (clientInfo != null && clientInfo.isNotEmpty) {
+    request.headers['X-Client-Info'] = clientInfo;
+  }
+  final hasActiveSession =
+      (client.auth.currentSession?.accessToken ?? '').isNotEmpty;
+  if (!hasActiveSession) {
+    final explicitAuth =
+        client.functions.headers['Authorization'] ??
+        client.functions.headers['authorization'] ??
+        client.headers['Authorization'] ??
+        client.headers['authorization'];
+    if (explicitAuth != null && explicitAuth.isNotEmpty) {
+      request.headers['Authorization'] = explicitAuth;
+    }
+  }
+  request.headers['Content-Type'] = 'application/json';
+  request.headers['Accept'] = 'application/pdf, application/json';
+  request.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
+  request.headers['Pragma'] = 'no-cache';
+  request.bodyBytes = utf8.encode(
+    jsonEncode(<String, String>{
+      'submission_id': cleanSubmissionId.toLowerCase(),
+    }),
+  );
+
+  final httpClient = client.rest.httpClient ?? http.Client();
+  final streamedResponse = await httpClient
+      .send(request)
+      .timeout(
+        timeout,
+        onTimeout: () {
+          _abortDownload(abortCompleter);
+          throw TimeoutException(
+            'Tempo limite excedido ao solicitar o download do PDF.',
+            timeout,
+          );
+        },
+      );
+
+  final status = streamedResponse.statusCode;
+  final declaredContentLength = _extractDeclaredContentLength(streamedResponse);
+  if (status < 200 || status >= 300) {
+    dynamic errorDetails;
+    if (declaredContentLength != null &&
+        declaredContentLength > _kMaxGatewayErrorBodyBytes) {
+      await _cancelResponseStream(streamedResponse.stream, abortCompleter);
+    } else {
+      final errorBytes = await _readBoundedResponseStream(
+        streamedResponse.stream,
+        maxBytes: _kMaxGatewayErrorBodyBytes,
+        timeout: timeout,
+        abortCompleter: abortCompleter,
+        onLimitExceeded: onFileTooLarge,
+        allowTruncationOnLimit: true,
+      );
+      if (errorBytes.isNotEmpty) {
+        final text = utf8.decode(errorBytes, allowMalformed: true);
+        try {
+          errorDetails = jsonDecode(text);
+        } catch (_) {
+          errorDetails = text;
+        }
+      }
+    }
+    throw FunctionException(
+      status: status,
+      details: errorDetails,
+      reasonPhrase: streamedResponse.reasonPhrase,
+    );
+  }
+
+  final contentType = _extractHeaderCaseInsensitive(
+    streamedResponse.headers,
+    'content-type',
+  ).toLowerCase();
+  if (contentType.contains('application/json')) {
+    await _cancelResponseStream(streamedResponse.stream, abortCompleter);
+    debugOnDownloadMetrics?.call(
+      const GatewayDownloadStreamMetrics(
+        chunksConsumed: 0,
+        totalBytesReceived: 0,
+        maxBytesAccumulated: 0,
+        retainedBytesAfterCancel: 0,
+        subscriptionCancelled: true,
+        rejectedByContentLength: false,
+      ),
+    );
+    throw onInvalidContentType();
+  }
+
+  if (declaredContentLength != null && declaredContentLength > maxBytes) {
+    await _cancelResponseStream(streamedResponse.stream, abortCompleter);
+    debugOnDownloadMetrics?.call(
+      const GatewayDownloadStreamMetrics(
+        chunksConsumed: 0,
+        totalBytesReceived: 0,
+        maxBytesAccumulated: 0,
+        retainedBytesAfterCancel: 0,
+        subscriptionCancelled: true,
+        rejectedByContentLength: true,
+      ),
+    );
+    throw onFileTooLarge();
+  }
+
+  final bytes = await _readBoundedResponseStream(
+    streamedResponse.stream,
+    maxBytes: maxBytes,
+    timeout: timeout,
+    abortCompleter: abortCompleter,
+    onLimitExceeded: onFileTooLarge,
+    onMetrics: debugOnDownloadMetrics,
+  );
+
+  if (bytes.isEmpty) {
+    throw onEmptyFile();
+  }
+
+  if (!PdfPreliminaryValidation.hasPdfHeader(bytes)) {
+    throw onInvalidPdfSignature();
+  }
+
+  return bytes;
+}
+
+String _extractHeaderCaseInsensitive(
+  Map<String, String> headers,
+  String targetKeyLower,
+) {
+  final direct = headers[targetKeyLower];
+  if (direct != null) {
+    return direct;
+  }
+  for (final entry in headers.entries) {
+    if (entry.key.toLowerCase() == targetKeyLower) {
+      return entry.value;
+    }
+  }
+  return '';
+}
+
+int? _extractDeclaredContentLength(http.StreamedResponse response) {
+  int? headerLength;
+  final rawHeader = _extractHeaderCaseInsensitive(
+    response.headers,
+    'content-length',
+  ).trim();
+  if (rawHeader.isNotEmpty) {
+    final parsed = int.tryParse(rawHeader);
+    if (parsed != null && parsed >= 0) {
+      headerLength = parsed;
+    }
+  }
+  final direct = response.contentLength;
+  if (direct != null && direct >= 0) {
+    if (headerLength != null && headerLength > direct) {
+      return headerLength;
+    }
+    return direct;
+  }
+  return headerLength;
+}
+
+void _abortDownload(Completer<void> abortCompleter) {
+  if (!abortCompleter.isCompleted) {
+    abortCompleter.complete();
+  }
+}
+
+Future<void> _cancelResponseStream(
+  Stream<List<int>> stream,
+  Completer<void> abortCompleter,
+) async {
+  try {
+    final sub = stream.listen(
+      (_) {},
+      onError: (Object _) {},
+      cancelOnError: true,
+    );
+    final cancellation = sub.cancel();
+    _abortDownload(abortCompleter);
+    await cancellation.timeout(
+      const Duration(milliseconds: 50),
+      onTimeout: () {},
+    );
+  } catch (_) {
+    _abortDownload(abortCompleter);
+  }
+}
+
+Future<Uint8List> _readBoundedResponseStream(
+  Stream<List<int>> stream, {
+  required int maxBytes,
+  required Duration timeout,
+  required Completer<void> abortCompleter,
+  required Exception Function() onLimitExceeded,
+  bool allowTruncationOnLimit = false,
+  void Function(GatewayDownloadStreamMetrics metrics)? onMetrics,
+}) async {
+  final builder = BytesBuilder(copy: false);
+  final completer = Completer<Uint8List>();
+  StreamSubscription<List<int>>? subscription;
+  var chunksConsumed = 0;
+  var totalReceivedBytes = 0;
+  var maxBytesAccumulated = 0;
+  var subscriptionCancelled = false;
+  var settled = false;
+  var shouldCancelAfterListen = false;
+
+  void emitMetrics() {
+    onMetrics?.call(
+      GatewayDownloadStreamMetrics(
+        chunksConsumed: chunksConsumed,
+        totalBytesReceived: totalReceivedBytes,
+        maxBytesAccumulated: maxBytesAccumulated,
+        retainedBytesAfterCancel: builder.length,
+        subscriptionCancelled: subscriptionCancelled,
+        rejectedByContentLength: false,
+      ),
+    );
+  }
+
+  Future<void> cancelSubscriptionIfActive() async {
+    final sub = subscription;
+    subscription = null;
+    if (sub != null) {
+      subscriptionCancelled = true;
+      try {
+        final cancellation = sub.cancel();
+        _abortDownload(abortCompleter);
+        await cancellation.timeout(
+          const Duration(milliseconds: 50),
+          onTimeout: () {},
+        );
+      } catch (_) {
+        _abortDownload(abortCompleter);
+      }
+    }
+  }
+
+  Future<void> cancelAndFail(Object error, [StackTrace? stackTrace]) async {
+    await cancelSubscriptionIfActive();
+    emitMetrics();
+    if (!completer.isCompleted) {
+      if (stackTrace != null) {
+        completer.completeError(error, stackTrace);
+      } else {
+        completer.completeError(error);
+      }
+    }
+  }
+
+  Future<void> cancelAndComplete(Uint8List bytes) async {
+    await cancelSubscriptionIfActive();
+    emitMetrics();
+    if (!completer.isCompleted) {
+      completer.complete(bytes);
+    }
+  }
+
+  subscription = stream.listen(
+    (List<int> chunk) {
+      if (settled || chunk.isEmpty) {
+        return;
+      }
+      chunksConsumed++;
+      totalReceivedBytes += chunk.length;
+      if (totalReceivedBytes > maxBytes) {
+        settled = true;
+        if (allowTruncationOnLimit) {
+          final truncated = builder.takeBytes();
+          if (subscription != null) {
+            unawaited(cancelAndComplete(truncated));
+          } else {
+            subscriptionCancelled = true;
+            shouldCancelAfterListen = true;
+            emitMetrics();
+            if (!completer.isCompleted) {
+              completer.complete(truncated);
+            }
+          }
+          return;
+        }
+        // Não acumula o bloco excedente e libera imediatamente os bytes anteriores.
+        builder.clear();
+        if (subscription != null) {
+          unawaited(cancelAndFail(onLimitExceeded()));
+        } else {
+          subscriptionCancelled = true;
+          shouldCancelAfterListen = true;
+        }
+        return;
+      }
+      builder.add(chunk);
+      if (builder.length > maxBytesAccumulated) {
+        maxBytesAccumulated = builder.length;
+      }
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      builder.clear();
+      subscription = null;
+      emitMetrics();
+      if (!completer.isCompleted) {
+        completer.completeError(error, stackTrace);
+      }
+    },
+    onDone: () {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      subscription = null;
+      final bytes = builder.takeBytes();
+      emitMetrics();
+      if (!completer.isCompleted) {
+        completer.complete(bytes);
+      }
+    },
+    cancelOnError: true,
+  );
+
+  if (shouldCancelAfterListen) {
+    if (allowTruncationOnLimit) {
+      await cancelSubscriptionIfActive();
+    } else {
+      await cancelAndFail(onLimitExceeded());
+    }
+  }
+
+  try {
+    return await completer.future.timeout(
+      timeout,
+      onTimeout: () async {
+        settled = true;
+        builder.clear();
+        await cancelSubscriptionIfActive();
+        _abortDownload(abortCompleter);
+        emitMetrics();
+        throw TimeoutException(
+          'Tempo limite excedido durante a leitura do PDF.',
+          timeout,
+        );
+      },
+    );
+  } finally {
+    if (subscription != null) {
+      await cancelSubscriptionIfActive();
+    }
   }
 }

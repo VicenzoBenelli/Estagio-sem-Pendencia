@@ -77,6 +77,17 @@ class RequirementDocumentsSection extends StatelessWidget {
               ),
               const SizedBox(height: 10),
             ],
+            if (item.status == RequirementStatus.correctionRequested) ...[
+              _SectionBanner(
+                key: Key('correction_requested_notice_${item.code}'),
+                icon: Icons.rate_review_outlined,
+                message:
+                    'Pendência de correção: verifique a justificativa registrada na revisão abaixo e envie um novo PDF (v${item.currentVersion + 1}). As versões anteriores permanecem preservadas no histórico.',
+                backgroundColor: colors.errorContainer.withValues(alpha: 0.65),
+                foregroundColor: colors.onErrorContainer,
+              ),
+              const SizedBox(height: 10),
+            ],
             if (canSubmit) ...[
               Wrap(
                 spacing: 8,
@@ -431,6 +442,15 @@ class _SubmissionVersionTile extends StatelessWidget {
                     label: 'Versão vigente',
                     backgroundColor: colors.primaryContainer,
                     foregroundColor: colors.onPrimaryContainer,
+                  )
+                else
+                  _MiniChip(
+                    key: Key(
+                      'historical_version_badge_${item.code}_v${submission.version}',
+                    ),
+                    label: 'Versão histórica preservada',
+                    backgroundColor: colors.surfaceContainerHighest,
+                    foregroundColor: colors.onSurfaceVariant,
                   ),
                 _MiniChip(
                   label: submission.status.label,
@@ -465,6 +485,7 @@ class _SubmissionVersionTile extends StatelessWidget {
               const SizedBox(height: 6),
               Text(
                 'Observação da revisão: ${review!.reason!.trim()}',
+                key: Key('review_reason_${item.code}_v${submission.version}'),
                 style: textTheme.bodySmall?.copyWith(
                   color: colors.onErrorContainer,
                   fontWeight: FontWeight.w500,

@@ -28,8 +28,5 @@ abstract interface class DocumentRepository {
     required String processRequirementId,
   });
 
-  Future<Uint8List> downloadSubmissionBytes({
-    required String storageBucket,
-    required String storagePath,
-  });
+  Future<Uint8List> downloadSubmissionBytes({required String submissionId});
 }

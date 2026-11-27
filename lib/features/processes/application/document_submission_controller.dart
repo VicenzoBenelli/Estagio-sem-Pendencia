@@ -557,8 +557,7 @@ class DocumentSubmissionController extends ChangeNotifier {
 
     try {
       final bytes = await repo.downloadSubmissionBytes(
-        storageBucket: submission.storageBucket,
-        storagePath: submission.storagePath,
+        submissionId: submission.id,
       );
       if (_disposed || epoch != _sessionEpoch) {
         return false;

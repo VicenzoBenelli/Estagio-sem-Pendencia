@@ -189,8 +189,7 @@ class _FakeDocumentRepository implements DocumentRepository {
 
   final List<String> submittedIdempotencyKeys = <String>[];
   final List<String> reconciledIdempotencyKeys = <String>[];
-  final List<(String bucket, String path)> downloadRequests =
-      <(String, String)>[];
+  final List<String> downloadRequests = <String>[];
 
   int submitCalls = 0;
   int fetchHistoryCalls = 0;
@@ -326,18 +325,26 @@ class _FakeDocumentRepository implements DocumentRepository {
 
   @override
   Future<Uint8List> downloadSubmissionBytes({
-    required String storageBucket,
-    required String storagePath,
+    required String submissionId,
   }) async {
-    downloadRequests.add((storageBucket, storagePath));
+    downloadRequests.add(submissionId);
     if (pendingDownload != null) {
       return pendingDownload!.future;
     }
     if (nextDownloadError != null) {
       throw nextDownloadError!;
     }
-    return storageBytesByPath[storagePath] ??
-        _sampleValidPdfBytes('downloaded');
+    for (final subs in submissionsByReq.values) {
+      for (final sub in subs) {
+        if (sub.id == submissionId) {
+          final bytes = storageBytesByPath[sub.storagePath];
+          if (bytes != null) {
+            return bytes;
+          }
+        }
+      }
+    }
+    return _sampleValidPdfBytes('downloaded');
   }
 }
 
@@ -1189,9 +1196,7 @@ void main() {
         await tester.tap(downloadBtn);
         await tester.pumpAndSettle();
 
-        expect(docRepo.downloadRequests, <(String, String)>[
-          (kPrivateDocumentsBucket, subV2.storagePath),
-        ]);
+        expect(docRepo.downloadRequests, <String>[subV2.id]);
         expect(picker.saveCalls, 1);
         expect(picker.lastSavedFilename, 'termo_atual_v2.pdf');
         expect(picker.lastSavedBytes, expectedV2Bytes);
@@ -1203,9 +1208,13 @@ void main() {
       const sensitiveToken = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.secret';
       final cases = <(int status, String code, String mustNotContain)>[
         (403, 'forbidden_owner', 'ERROR: [ERR:forbidden_owner] owner=123'),
+        (403, 'forbidden_inactive_profile', 'profiles.active = false'),
         (400, 'empty_file', 'sqlstate 22023'),
+        (400, 'invalid_submission_id', 'uuid parse error'),
+        (400, 'unsupported_destination_parameter', 'storage_path supplied'),
         (401, 'invalid_or_expired_session', sensitiveToken),
         (404, 'requirement_not_found', 'SELECT * FROM process_requirements'),
+        (404, 'submission_not_found', 'SELECT * FROM document_submissions'),
         (409, 'requirement_status_conflict', 'uq_document_submissions'),
         (413, 'file_too_large', '5242880 stack trace'),
         (415, 'unsupported_media_type', '/storage/v1/object'),

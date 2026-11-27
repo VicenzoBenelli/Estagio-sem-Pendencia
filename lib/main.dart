@@ -9,6 +9,8 @@ import 'features/processes/data/supabase_document_repository.dart';
 import 'features/processes/data/supabase_process_repository.dart';
 import 'features/processes/domain/document_repository.dart';
 import 'features/processes/domain/process_repository.dart';
+import 'features/review/data/supabase_review_repository.dart';
+import 'features/review/domain/review_repository.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,6 +19,7 @@ Future<void> main() async {
   AuthController authController;
   ProcessRepository? processRepository;
   DocumentRepository? documentRepository;
+  ReviewRepository? reviewRepository;
 
   if (config.isConfigured) {
     await Supabase.initialize(
@@ -34,6 +37,7 @@ Future<void> main() async {
     );
     processRepository = SupabaseProcessRepository(client);
     documentRepository = SupabaseDocumentRepository(client);
+    reviewRepository = SupabaseReviewRepository(client);
   } else {
     authController = AuthController(gateway: null);
   }
@@ -45,6 +49,7 @@ Future<void> main() async {
       authController: authController,
       processRepository: processRepository,
       documentRepository: documentRepository,
+      reviewRepository: reviewRepository,
     ),
   );
 }

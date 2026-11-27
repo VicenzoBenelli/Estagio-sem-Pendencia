@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(55);
+select plan(60);
 
 -- ============================================================================
 -- 1. ESP-13 / ESP-14: Bucket privado, RLS restritiva no Storage e privilégios
@@ -29,15 +29,24 @@ select is(
 
 select is(
   (
-    select count(*)::integer
-    from pg_policies
-    where schemaname = 'storage'
-      and tablename = 'objects'
-      and cmd = 'SELECT'
-      and policyname = 'internship_documents_select_authorized'
+    select (
+      (
+        select count(*)::integer
+        from pg_policies
+        where schemaname = 'storage'
+          and tablename = 'objects'
+          and cmd = 'SELECT'
+          and (roles && array['anon'::name, 'authenticated'::name])
+      ) = 0
+      and (
+        select c.relrowsecurity
+        from pg_class as c
+        where c.oid = 'storage.objects'::regclass
+      ) = true
+    )
   ),
-  1,
-  'Policy SELECT autorizada existe em storage.objects para internship-documents'
+  true,
+  'Gateway server-side ativo: zero policies SELECT diretas para anon/authenticated em storage.objects com RLS habilitada'
 );
 
 select is(
@@ -88,9 +97,12 @@ select is(
     or has_function_privilege('authenticated', 'public.prepare_submission_orphan_cleanup(uuid, text, text)', 'EXECUTE')
     or has_function_privilege('authenticated', 'public.compensate_document_submission_intent(uuid, text, text, text)', 'EXECUTE')
     or has_function_privilege('authenticated', 'public.assert_submission_backend_caller()', 'EXECUTE')
+    or has_function_privilege('public', 'public.authorize_document_submission_download(uuid, uuid, bigint)', 'EXECUTE')
+    or has_function_privilege('anon', 'public.authorize_document_submission_download(uuid, uuid, bigint)', 'EXECUTE')
+    or has_function_privilege('authenticated', 'public.authorize_document_submission_download(uuid, uuid, bigint)', 'EXECUTE')
   ),
   false,
-  'PUBLIC, anon e authenticated não possuem EXECUTE nas RPCs internas de submissão'
+  'PUBLIC, anon e authenticated não possuem EXECUTE nas RPCs internas de submissão nem no gateway de download'
 );
 
 select is(
@@ -104,13 +116,14 @@ select is(
         'finalize_document_submission',
         'release_document_submission_attempt',
         'prepare_submission_orphan_cleanup',
-        'compensate_document_submission_intent'
+        'compensate_document_submission_intent',
+        'authorize_document_submission_download'
       )
       and p.prosecdef = true
       and p.proconfig @> array['search_path=""']
   ),
-  6,
-  'Todas as 6 funções de submissão são SECURITY DEFINER com search_path vazio'
+  7,
+  'Todas as 7 funções de submissão/download são SECURITY DEFINER com search_path vazio'
 );
 
 -- ============================================================================
@@ -641,9 +654,38 @@ select is(
     where bucket_id = 'internship-documents'
       and name = current_setting('estagio.test_path_v1')
   ),
-  1,
-  'Estudante A3 dono do processo acessa o próprio objeto PDF via download autenticado no Storage'
+  0,
+  'Estudante A3 não acessa objeto PDF diretamente em storage.objects após fechamento pelo gateway server-side'
 );
+
+select throws_ok(
+  $$ select public.authorize_document_submission_download(
+       'a3000000-0000-4000-8000-000000000001'::uuid,
+       current_setting('estagio.test_sub_v1')::uuid,
+       5242880
+     ) $$,
+  '42501',
+  null,
+  'authenticated não pode executar public.authorize_document_submission_download diretamente'
+);
+
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+select is(
+  (
+    public.authorize_document_submission_download(
+      'a3000000-0000-4000-8000-000000000001'::uuid,
+      current_setting('estagio.test_sub_v1')::uuid,
+      5242880
+    ) ->> 'access_role'
+  ),
+  'owner',
+  'Gateway backend autoriza Estudante A3 dono do processo a baixar v1 via authorize_document_submission_download'
+);
+
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub":"a3000000-0000-4000-8000-000000000001","role":"authenticated"}', true);
 
 select set_config('storage.operation', 'storage.object.sign', true);
 select is(
@@ -705,9 +747,28 @@ select is(
     where bucket_id = 'internship-documents'
       and name = current_setting('estagio.test_path_v1')
   ),
-  1,
-  'Revisor R1 com assignment ativo no escopo acessa o PDF submetido via download autenticado'
+  0,
+  'Revisor R1 com assignment ativo também é bloqueado na leitura direta de storage.objects'
 );
+
+reset role;
+select set_config('request.jwt.claims', '', true);
+select set_config('storage.operation', '', true);
+
+select is(
+  (
+    public.authorize_document_submission_download(
+      'd3000000-0000-4000-8000-000000000004'::uuid,
+      current_setting('estagio.test_sub_v1')::uuid,
+      5242880
+    ) ->> 'access_role'
+  ),
+  'reviewer',
+  'Gateway backend autoriza Revisor R1 com assignment ativo no escopo a baixar o PDF submetido'
+);
+
+set local role authenticated;
+select set_config('storage.operation', 'storage.object.get_authenticated', true);
 
 select set_config('request.jwt.claims', '{"sub":"e3000000-0000-4000-8000-000000000005","role":"authenticated"}', true);
 
@@ -751,12 +812,23 @@ select is(
       and name = current_setting('estagio.test_path_v1')
   ),
   0,
-  'Revisor R1 revogado perde imediatamente acesso ao objeto PDF em storage.objects'
+  'Revisor R1 revogado permanece bloqueado em storage.objects'
 );
 
 reset role;
 select set_config('request.jwt.claims', '', true);
 select set_config('storage.operation', '', true);
+
+select throws_ok(
+  $$ select public.authorize_document_submission_download(
+       'd3000000-0000-4000-8000-000000000004'::uuid,
+       current_setting('estagio.test_sub_v1')::uuid,
+       5242880
+     ) $$,
+  'P0002',
+  null,
+  'Revisor R1 revogado perde imediatamente autorização no gateway backend'
+);
 
 -- ============================================================================
 -- 7. ESP-15: Reenvio pós-correção (v2), preservação de v1, imutabilidade e bloqueio após approved
@@ -852,13 +924,33 @@ select is(
     where bucket_id = 'internship-documents'
       and name in (current_setting('estagio.test_path_v1'), current_setting('estagio.test_path_v2'))
   ),
-  2,
-  'Estudante A3 acessa tanto a versão v1 histórica quanto a versão v2 vigente no Storage privado'
+  0,
+  'Estudante A3 não acessa v1/v2 diretamente em storage.objects após fechamento pelo gateway'
 );
 
 reset role;
 select set_config('request.jwt.claims', '', true);
 select set_config('storage.operation', '', true);
+
+select is(
+  row(
+    public.authorize_document_submission_download(
+      'a3000000-0000-4000-8000-000000000001'::uuid,
+      current_setting('estagio.test_sub_v1')::uuid,
+      5242880
+    ) ->> 'storage_path',
+    public.authorize_document_submission_download(
+      'a3000000-0000-4000-8000-000000000001'::uuid,
+      current_setting('estagio.test_sub_v2')::uuid,
+      5242880
+    ) ->> 'storage_path'
+  )::text,
+  row(
+    current_setting('estagio.test_path_v1'),
+    current_setting('estagio.test_path_v2')
+  )::text,
+  'Gateway autoriza Estudante A3 a acessar tanto a versão v1 histórica quanto a versão v2 vigente'
+);
 
 -- Imutabilidade: não pode apagar nem alterar metadados/versão/path de submissões ou intents
 select throws_ok(
